@@ -23,12 +23,31 @@ def add_cors_headers(response):
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return response
 
-GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or os.getenv("GROK_API_KEY") or "").strip()
-GROQ_MODEL = (os.getenv("GROQ_MODEL") or "").strip()
+def clean_env_value(value):
+    value = (value or "").strip().strip("\"'")
+    if "=" in value:
+        value = value.split("=", 1)[1].strip().strip("\"'")
+    if ":" in value:
+        value = value.split(":", 1)[1].strip().strip("\"',{} ")
+    return value
+
+
+GROQ_API_KEY = clean_env_value(os.getenv("GROQ_API_KEY") or os.getenv("GROK_API_KEY"))
+GROQ_MODEL = clean_env_value(os.getenv("GROQ_MODEL"))
 if not GROQ_MODEL:
-    old_model = os.getenv("GROK_MODEL", "").strip()
+    old_model = clean_env_value(os.getenv("GROK_MODEL"))
     GROQ_MODEL = old_model if old_model and not old_model.lower().startswith("grok-") else "llama-3.3-70b-versatile"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+GEMINI_API_KEY = clean_env_value(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
+GEMINI_MODEL = clean_env_value(os.getenv("GEMINI_MODEL")) or "gemini-3.5-flash"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+CLAUDE_API_KEY = clean_env_value(os.getenv("CLAUDE_API_KEY") or os.getenv("ANTHROPIC_API_KEY"))
+CLAUDE_MODEL = clean_env_value(os.getenv("CLAUDE_MODEL")) or "claude-haiku-4-5"
+CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
+
+MAX_OUTPUT_TOKENS = int(clean_env_value(os.getenv("MAX_OUTPUT_TOKENS")) or "600")
 
 KNOWLEDGE_SOURCES = {
     "HEC Pakistan": "https://www.hec.gov.pk/",
@@ -120,6 +139,28 @@ def pick_sources_for_query(query):
 
 
 def build_website_context(query):
+    q = query.lower()
+    needs_context = any(
+        word in q
+        for word in [
+            "bzu",
+            "caspam",
+            "admission",
+            "apply",
+            "merit",
+            "fee",
+            "prospectus",
+            "hec",
+            "degree",
+            "attestation",
+            "recognition",
+            "equivalence",
+            "department",
+        ]
+    )
+    if not needs_context:
+        return ""
+
     chunks = []
     for source in pick_sources_for_query(query):
         try:
@@ -141,6 +182,149 @@ def normalize_messages(messages):
     return clean_messages
 
 
+def readable_groq_error(error_detail):
+    if isinstance(error_detail, dict):
+        error = error_detail.get("error")
+        if isinstance(error, dict):
+            return error.get("message") or str(error)
+        return error_detail.get("message") or str(error_detail)
+    return str(error_detail)
+
+
+def context_message(website_context):
+    if not website_context:
+        return "No live website context was needed for this question."
+    return (
+        "Use this official website context when it is relevant. "
+        "Do not invent details that are not present here.\n\n"
+        f"{website_context}"
+    )
+
+
+def call_groq(messages, context_prompt):
+    if not GROQ_API_KEY:
+        raise RuntimeError("Groq API key is missing.")
+
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": context_prompt},
+            *messages,
+        ],
+        "temperature": 0.4,
+        "max_completion_tokens": MAX_OUTPUT_TOKENS,
+        "stream": False,
+    }
+    response = requests.post(
+        GROQ_API_URL,
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=60,
+    )
+    if not response.ok:
+        try:
+            error_detail = response.json()
+        except Exception:
+            error_detail = response.text
+        raise RuntimeError(readable_groq_error(error_detail))
+    result = response.json()
+    return result["choices"][0]["message"]["content"]
+
+
+def call_gemini(messages, context_prompt):
+    if not GEMINI_API_KEY:
+        raise RuntimeError("Gemini API key is missing.")
+
+    contents = []
+    for msg in messages:
+        contents.append(
+            {
+                "role": "model" if msg["role"] == "assistant" else "user",
+                "parts": [{"text": msg["content"]}],
+            }
+        )
+
+    payload = {
+        "systemInstruction": {
+            "parts": [{"text": f"{SYSTEM_PROMPT}\n\n{context_prompt}"}]
+        },
+        "contents": contents,
+        "generationConfig": {
+            "temperature": 0.4,
+            "maxOutputTokens": MAX_OUTPUT_TOKENS,
+        },
+    }
+    response = requests.post(
+        GEMINI_API_URL.format(model=GEMINI_MODEL),
+        headers={
+            "x-goog-api-key": GEMINI_API_KEY,
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=60,
+    )
+    if not response.ok:
+        try:
+            error_detail = response.json()
+        except Exception:
+            error_detail = response.text
+        raise RuntimeError(str(error_detail))
+    result = response.json()
+    return result["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def call_claude(messages, context_prompt):
+    if not CLAUDE_API_KEY:
+        raise RuntimeError("Claude API key is missing.")
+
+    payload = {
+        "model": CLAUDE_MODEL,
+        "system": f"{SYSTEM_PROMPT}\n\n{context_prompt}",
+        "messages": messages,
+        "temperature": 0.4,
+        "max_tokens": MAX_OUTPUT_TOKENS,
+    }
+    response = requests.post(
+        CLAUDE_API_URL,
+        headers={
+            "x-api-key": CLAUDE_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=60,
+    )
+    if not response.ok:
+        try:
+            error_detail = response.json()
+        except Exception:
+            error_detail = response.text
+        raise RuntimeError(str(error_detail))
+    result = response.json()
+    return "".join(block.get("text", "") for block in result.get("content", []))
+
+
+def generate_reply(messages, context_prompt):
+    providers = [
+        ("Groq", call_groq),
+        ("Gemini", call_gemini),
+        ("Claude", call_claude),
+    ]
+    errors = []
+    for provider, caller in providers:
+        try:
+            reply = caller(messages, context_prompt)
+            return provider, reply
+        except Exception as exc:
+            errors.append(f"{provider}: {exc}")
+            print(f"{provider} API error: {exc}", flush=True)
+    raise RuntimeError(" | ".join(errors))
+
+
 @app.get("/")
 def home():
     return send_from_directory(BASE_DIR, "index.html")
@@ -156,9 +340,11 @@ def health():
     return jsonify(
         {
             "ok": True,
-            "provider": "Groq",
-            "model": GROQ_MODEL,
-            "has_api_key": bool(GROQ_API_KEY),
+            "providers": {
+                "groq": {"model": GROQ_MODEL, "has_api_key": bool(GROQ_API_KEY)},
+                "gemini": {"model": GEMINI_MODEL, "has_api_key": bool(GEMINI_API_KEY)},
+                "claude": {"model": CLAUDE_MODEL, "has_api_key": bool(CLAUDE_API_KEY)},
+            },
             "sources": KNOWLEDGE_SOURCES,
         }
     )
@@ -166,8 +352,8 @@ def health():
 
 @app.post("/api/chat")
 def chat():
-    if not GROQ_API_KEY:
-        return jsonify({"error": "GROQ_API_KEY is missing. Add it in your .env file."}), 500
+    if not any([GROQ_API_KEY, GEMINI_API_KEY, CLAUDE_API_KEY]):
+        return jsonify({"error": "Add at least one API key: GROQ_API_KEY, GEMINI_API_KEY, or CLAUDE_API_KEY."}), 500
 
     data = request.get_json(silent=True) or {}
     messages = normalize_messages(data.get("messages", []))
@@ -176,50 +362,17 @@ def chat():
         return jsonify({"error": "No messages received."}), 400
 
     latest_user_message = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
-    website_context = build_website_context(latest_user_message)
+    if not re.search(r"[A-Za-z0-9\u0600-\u06FF]", latest_user_message):
+        return jsonify({"reply": "Please type a clear question so I can help you."})
 
-    context_prompt = (
-        "Use this official website context when it is relevant. "
-        "Do not invent details that are not present here.\n\n"
-        f"{website_context}"
-    )
-
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "system", "content": context_prompt},
-            *messages,
-        ],
-        "temperature": 0.4,
-        "max_completion_tokens": 1200,
-        "stream": False,
-    }
+    context_prompt = context_message(build_website_context(latest_user_message))
 
     try:
-        response = requests.post(
-            GROQ_API_URL,
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=60,
-        )
-
-        if not response.ok:
-            try:
-                error_detail = response.json()
-            except Exception:
-                error_detail = response.text
-            return jsonify({"error": "Groq API error", "details": error_detail}), response.status_code
-
-        result = response.json()
-        reply = result["choices"][0]["message"]["content"]
-        return jsonify({"reply": reply})
+        provider, reply = generate_reply(messages, context_prompt)
+        return jsonify({"provider": provider, "reply": reply})
 
     except requests.Timeout:
-        return jsonify({"error": "Groq API request timed out. Please try again."}), 504
+        return jsonify({"error": "AI request timed out. Please try again."}), 504
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
