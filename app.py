@@ -27,7 +27,7 @@ def clean_env_value(value):
     value = (value or "").strip().strip("\"'")
     if "=" in value:
         value = value.split("=", 1)[1].strip().strip("\"'")
-    if ":" in value:
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*:", value):
         value = value.split(":", 1)[1].strip().strip("\"',{} ")
     return value
 
@@ -48,6 +48,15 @@ CLAUDE_MODEL = clean_env_value(os.getenv("CLAUDE_MODEL")) or "claude-haiku-4-5"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 MAX_OUTPUT_TOKENS = int(clean_env_value(os.getenv("MAX_OUTPUT_TOKENS")) or "600")
+
+FIREBASE_CONFIG = {
+    "apiKey": clean_env_value(os.getenv("FIREBASE_API_KEY")),
+    "authDomain": clean_env_value(os.getenv("FIREBASE_AUTH_DOMAIN")),
+    "projectId": clean_env_value(os.getenv("FIREBASE_PROJECT_ID")),
+    "storageBucket": clean_env_value(os.getenv("FIREBASE_STORAGE_BUCKET")),
+    "messagingSenderId": clean_env_value(os.getenv("FIREBASE_MESSAGING_SENDER_ID")),
+    "appId": clean_env_value(os.getenv("FIREBASE_APP_ID")),
+}
 
 KNOWLEDGE_SOURCES = {
     "HEC Pakistan": "https://www.hec.gov.pk/",
@@ -330,11 +339,6 @@ def home():
     return send_from_directory(BASE_DIR, "index.html")
 
 
-@app.get("/<path:path>")
-def static_files(path):
-    return send_from_directory(BASE_DIR, path)
-
-
 @app.get("/api/health")
 def health():
     return jsonify(
@@ -348,6 +352,15 @@ def health():
             "sources": KNOWLEDGE_SOURCES,
         }
     )
+
+
+@app.get("/api/firebase-config")
+def firebase_config():
+    enabled = all(
+        FIREBASE_CONFIG.get(key)
+        for key in ["apiKey", "authDomain", "projectId", "appId"]
+    )
+    return jsonify({"enabled": enabled, "config": FIREBASE_CONFIG if enabled else {}})
 
 
 @app.post("/api/chat")
@@ -406,6 +419,11 @@ def bzu_info(subpath=""):
         return jsonify({"url": url, "content": content, "links": KNOWLEDGE_SOURCES})
     except Exception as exc:
         return jsonify({"error": str(exc), "links": KNOWLEDGE_SOURCES}), 502
+
+
+@app.get("/<path:path>")
+def static_files(path):
+    return send_from_directory(BASE_DIR, path)
 
 
 if __name__ == "__main__":
