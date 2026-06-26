@@ -7,8 +7,8 @@
     <title>CASPAM-Bot | BZU Multan</title>
     <link href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Sans:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/tokyo-night-dark.min.css" />
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+    <script async src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script async src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
     <style>
          :root {
             --bg0: #07080f;
@@ -1360,6 +1360,109 @@
             border-color: rgba(244, 63, 94, .3);
             color: var(--rose)
         }
+        
+        #authGate {
+            position: fixed;
+            inset: 0;
+            z-index: 5000;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            background: rgba(7, 8, 15, .92);
+            backdrop-filter: blur(14px)
+        }
+        
+        #authGate.show {
+            display: flex
+        }
+        
+        .auth-card {
+            width: min(420px, 100%);
+            background: var(--bg1);
+            border: 1px solid var(--bd2);
+            border-radius: 12px;
+            padding: 24px;
+            box-shadow: 0 24px 80px rgba(0, 0, 0, .35)
+        }
+        
+        .auth-title {
+            font-family: 'Syne', sans-serif;
+            font-size: 24px;
+            font-weight: 800;
+            margin-bottom: 8px
+        }
+        
+        .auth-copy {
+            color: var(--t1);
+            font-size: 13px;
+            line-height: 1.6;
+            margin-bottom: 18px
+        }
+        
+        .auth-btn {
+            width: 100%;
+            border: 1px solid var(--bd2);
+            border-radius: 9px;
+            padding: 12px 14px;
+            background: var(--bg2);
+            color: var(--t0);
+            font-family: 'DM Sans', sans-serif;
+            font-size: 14px;
+            font-weight: 700;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            transition: var(--ease)
+        }
+        
+        .auth-btn:hover {
+            border-color: var(--blue);
+            box-shadow: var(--glow)
+        }
+        
+        .auth-note {
+            margin-top: 12px;
+            color: var(--t2);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 10px;
+            line-height: 1.6
+        }
+        
+        .user-pill {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            border: 1px solid var(--bd);
+            background: var(--bg2);
+            border-radius: 999px;
+            padding: 6px 10px;
+            color: var(--t1);
+            font-size: 12px;
+            max-width: 240px
+        }
+        
+        .user-pill img {
+            width: 22px;
+            height: 22px;
+            border-radius: 50%
+        }
+        
+        .user-pill span {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap
+        }
+        
+        .link-btn {
+            border: none;
+            background: none;
+            color: var(--blue);
+            cursor: pointer;
+            font: inherit
+        }
         /* Mobile */
         
         #ov {
@@ -1426,6 +1529,18 @@
     <div id="toast"></div>
     <div id="ov" onclick="closeSB()"></div>
 
+    <div id="authGate">
+        <div class="auth-card">
+            <div class="auth-title">CASPAM-Bot</div>
+            <div class="auth-copy">Sign in to sync your chats, projects, and gems across devices.</div>
+            <button class="auth-btn" onclick="signInWithGoogle()">
+                <span>G</span>
+                Continue with Google
+            </button>
+            <div class="auth-note" id="authNote">You can keep using CASPAM-Bot without signing in.</div>
+        </div>
+    </div>
+
     <div id="pov" onclick="closePovBg(event)">
         <div class="panel">
             <div class="p-hd">
@@ -1451,6 +1566,7 @@
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg>
       New Chat
     </button>
+            <div class="user-pill" id="userPill" style="display:none;margin:8px 12px 4px;max-width:none"></div>
             <div class="sb-body">
                 <div class="nav-a on" id="nav-chats" onclick="setNav('chats')">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg> Chats <span class="chip">Live</span>
@@ -1479,7 +1595,7 @@
                     <div class="ac-r"><span class="ac-k">University</span><span class="ac-v">Bahauddin Zakariya University, Multan</span></div>
                     <div class="ac-r"><span class="ac-k">Dept</span><span class="ac-v"> Maths &amp; CS</span></div>
                     <div class="ac-r"><span class="ac-k">Purpose</span><span class="ac-v">Student AI Assistant for BZU</span></div>
-                    <div class="ac-r"><span class="ac-k">Powered</span><span class="ac-v">Multi-model AI</span></div>
+                    <div class="ac-r"><span class="ac-k">Powered</span><span class="ac-v">Multi-model Ai</span></div>
                     <div class="ac-tags">
                         <span class="ac-tag">BZU Multan</span><span class="ac-tag">AI / ML</span>
                         <span class="ac-tag">CASPAM</span><span class="ac-tag">2025</span>
@@ -1487,7 +1603,7 @@
                 </div>
             </div>
             <div class="sb-ft">
-                <p>Powered by <span></span>Multi-model AI<br>CASPAM · BZU Multan · 2026</p>
+                <p>Powered by <span>Multi-model Ai</span><br>CASPAM · BZU Multan · 2025</p>
             </div>
         </aside>
 
@@ -1556,11 +1672,11 @@
         </main>
     </div>
 
+    <script async src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
+    <script async src="https://www.gstatic.com/firebasejs/10.12.5/firebase-auth-compat.js"></script>
+    <script async src="https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore-compat.js"></script>
     <script>
-        marked.setOptions({
-            breaks: true,
-            gfm: true
-        });
+        document.documentElement.dataset.caspamStarted = '1';
 
         // ── STATE ─────────────────────────────────
         let msgs = []; // [{role,content}]
@@ -1568,6 +1684,10 @@
         const SK = 'caspam_v6';
         const GK = 'caspam_user_gems_v1';
         const PK = 'caspam_user_projects_v1';
+        let currentUser = null;
+        let db = null;
+        let cloudReady = false;
+        let currentContext = null;
 
         const SYS = `You are CASPAM-Bot, the official AI assistant for CASPAM (Centre for Advanced Studies in Pure and Applied Mathematics), BZU Multan, Pakistan.
 
@@ -1581,9 +1701,189 @@ RULES:
 7. Be helpful, friendly, and encouraging to BZU students.
 8. Answer ANY topic — math, science, coding, AI, career, general knowledge.
 9. You are CASPAM-Bot , made exclusively for BZU Multan students.
-10. If asked who created you, who made you, who built you, your owner, your developer, or your author, answer only with this identity: "Muqaddas Yamin is my author.She is currently studying BS Artificial intelligence at BZU Multan. She made me to help CASPAM and BZU students." Do not mention Meta, OpenAI, Groq, Anthropic, or the base model in that answer.`;
+10. If asked who created you, who made you, who built you, your owner, your developer, or your author, answer only with this identity: "Muqaddas Yamin is my author. She made me to help CASPAM and BZU students." Do not mention Meta, OpenAI, Groq, Anthropic, or the base model in that answer.`;
 
         // ── SESSIONS ──────────────────────────────
+        async function initFirebase() {
+            const note = document.getElementById('authNote');
+            try {
+                document.documentElement.dataset.firebaseStep = 'init-start';
+                if (note) note.textContent = 'Checking Firebase setup...';
+                const data = await getFirebaseConfig();
+                document.documentElement.dataset.firebaseStep = data.enabled ? 'config-enabled' : 'config-disabled';
+                if (!data.enabled) {
+                    cloudReady = false;
+                    document.getElementById('authGate').classList.remove('show');
+                    if (note) note.textContent = 'Firebase is not configured yet. Local mode is active.';
+                    updateAuthUI(null);
+                    renderHist();
+                    updateSavedCounts();
+                    return;
+                }
+
+                if (note) note.textContent = 'Loading Google login...';
+                if (!await waitForFirebaseSdk()) {
+                    document.documentElement.dataset.firebaseStep = 'sdk-missing';
+                    cloudReady = false;
+                    document.getElementById('authGate').classList.remove('show');
+                    if (note) note.textContent = 'Firebase login library did not load. Check internet connection, then refresh.';
+                    updateAuthUI(null);
+                    renderHist();
+                    updateSavedCounts();
+                    return;
+                }
+
+                document.documentElement.dataset.firebaseStep = 'sdk-ready';
+                firebase.initializeApp(data.config);
+                document.documentElement.dataset.firebaseStep = 'app-initialized';
+                db = firebase.firestore();
+                document.documentElement.dataset.firebaseStep = 'firestore-ready';
+                cloudReady = true;
+                if (note) note.textContent = 'Please continue with Google.';
+
+                firebase.auth().onAuthStateChanged(async user => {
+                    document.documentElement.dataset.firebaseStep = user ? 'user-signed-in' : 'user-signed-out';
+                    currentUser = user;
+                    updateAuthUI(user);
+                    if (user) {
+                        await loadCloudData();
+                        document.getElementById('authGate').classList.remove('show');
+                        renderHist();
+                        updateSavedCounts();
+                        toast('Signed in');
+                    } else {
+                        document.getElementById('authGate').classList.remove('show');
+                        renderHist();
+                        updateSavedCounts();
+                    }
+                });
+            } catch (err) {
+                console.error('Firebase init failed:', err);
+                cloudReady = false;
+                document.getElementById('authGate').classList.remove('show');
+                if (note) note.textContent = 'Login setup could not load. Local mode is active.';
+                updateAuthUI(null);
+                renderHist();
+                updateSavedCounts();
+            }
+        }
+
+        function getFirebaseConfig() {
+            return new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest();
+                xhr.open('GET', '/api/firebase-config', true);
+                xhr.onload = () => {
+                    try {
+                        resolve(JSON.parse(xhr.responseText || '{}'));
+                    } catch (err) {
+                        reject(err);
+                    }
+                };
+                xhr.onerror = () => reject(new Error('Could not load Firebase config.'));
+                xhr.timeout = 8000;
+                xhr.ontimeout = () => reject(new Error('Firebase config request timed out.'));
+                document.documentElement.dataset.firebaseStep = 'config-request';
+                xhr.send();
+            });
+        }
+
+        function waitForFirebaseSdk(timeout = 9000) {
+            return new Promise(resolve => {
+                const started = Date.now();
+                const timer = setInterval(() => {
+                    const ready = window.firebase && firebase.auth && firebase.firestore;
+                    if (ready || Date.now() - started > timeout) {
+                        clearInterval(timer);
+                        resolve(!!ready);
+                    }
+                }, 150);
+            });
+        }
+
+        function userCollection(name) {
+            return db.collection('users').doc(currentUser.uid).collection(name);
+        }
+
+        async function loadCloudData() {
+            if (!cloudReady || !currentUser) return;
+            await Promise.all([
+                loadCollection('chats', SK),
+                loadCollection('gems', GK),
+                loadCollection('projects', PK)
+            ]);
+        }
+
+        async function loadCollection(collectionName, storageKey) {
+            const snap = await userCollection(collectionName).orderBy('ts', 'desc').get();
+            const items = snap.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            }));
+            const localItems = getSaved(storageKey);
+            if (!items.length && localItems.length) {
+                await syncCollection(collectionName, localItems);
+                return;
+            }
+            localStorage.setItem(storageKey, JSON.stringify(items));
+        }
+
+        async function syncCollection(collectionName, items) {
+            if (!cloudReady || !currentUser) return;
+            try {
+                const batch = db.batch();
+                items.forEach(item => {
+                    const ref = userCollection(collectionName).doc(item.id);
+                    batch.set(ref, item, {
+                        merge: true
+                    });
+                });
+                await batch.commit();
+            } catch (err) {
+                toast('Cloud save failed', true);
+            }
+        }
+
+        async function deleteCloudItem(collectionName, id) {
+            if (!cloudReady || !currentUser) return;
+            try {
+                await userCollection(collectionName).doc(id).delete();
+            } catch (err) {
+                toast('Cloud delete failed', true);
+            }
+        }
+
+        function signInWithGoogle() {
+            if (!cloudReady || !window.firebase) {
+                toast('Google sync is still loading. Refresh and try again.', true);
+                return;
+            }
+            const provider = new firebase.auth.GoogleAuthProvider();
+            firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL)
+                .then(() => firebase.auth().signInWithPopup(provider))
+                .catch(err => {
+                    const note = document.getElementById('authNote');
+                    if (note) note.textContent = err.message;
+                    toast(err.message, true);
+                });
+        }
+
+        function signOut() {
+            if (window.firebase) firebase.auth().signOut();
+        }
+
+        function updateAuthUI(user) {
+            const pill = document.getElementById('userPill');
+            if (!pill) return;
+            if (!user) {
+                pill.style.display = 'flex';
+                pill.innerHTML = `<span>Local only</span><button class="link-btn" onclick="signInWithGoogle()">Sign in to sync</button>`;
+                return;
+            }
+            const photo = user.photoURL ? `<img src="${esc(user.photoURL)}" alt="">` : '';
+            pill.style.display = 'flex';
+            pill.innerHTML = `${photo}<span>${esc(user.displayName || user.email || 'Student')}</span><button class="link-btn" onclick="signOut()">Logout</button>`;
+        }
+
         function getSess() {
             try {
                 return JSON.parse(localStorage.getItem(SK) || '[]')
@@ -1593,7 +1893,8 @@ RULES:
         }
 
         function putSess(a) {
-            localStorage.setItem(SK, JSON.stringify(a))
+            localStorage.setItem(SK, JSON.stringify(a));
+            if (cloudReady) syncCollection('chats', a);
         }
 
         function saveSess(first) {
@@ -1604,7 +1905,8 @@ RULES:
                 id: sessId,
                 title: first,
                 ts: Date.now(),
-                msgs
+                msgs,
+                context: currentContext
             };
             if (i >= 0) all[i] = o;
             else all.unshift(o);
@@ -1617,6 +1919,7 @@ RULES:
             if (!s) return;
             sessId = s.id;
             msgs = s.msgs || [];
+            currentContext = s.context || null;
             wipeUI();
             document.getElementById('welcome').style.display = 'none';
             msgs.forEach(m => addMsg(m.role === 'user' ? 'user' : 'bot', m.content, true));
@@ -1628,9 +1931,11 @@ RULES:
             e.stopPropagation();
             const f = getSess().filter(s => s.id !== id);
             putSess(f);
+            deleteCloudItem('chats', id);
             if (sessId === id) {
                 sessId = null;
                 msgs = [];
+                currentContext = null;
                 wipeUI();
             }
             renderHist();
@@ -1683,7 +1988,8 @@ RULES:
             const data = await readJson(response);
 
             if (!response.ok) {
-                throw new Error(data.error || data.details || 'API Error: ' + response.status);
+                const detail = typeof data.details === 'string' ? data.details : JSON.stringify(data.details || {});
+                throw new Error(data.error || detail || 'API Error: ' + response.status);
             }
 
             return data.reply;
@@ -1751,7 +2057,7 @@ RULES:
             bub.className = 'bub';
             if (role === 'bot') {
                 bub.innerHTML = renderMD(text);
-                bub.querySelectorAll('pre code').forEach(b => hljs.highlightElement(b));
+                if (window.hljs) bub.querySelectorAll('pre code').forEach(b => hljs.highlightElement(b));
             } else bub.textContent = text;
             col.appendChild(bub);
             if (role === 'bot') {
@@ -1774,6 +2080,9 @@ RULES:
         }
 
         function renderMD(raw) {
+            if (!window.marked) {
+                return esc(raw).replace(/\n/g, '<br>');
+            }
             const blocks = [];
             let p = raw.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
                 const i = blocks.length;
@@ -1823,6 +2132,7 @@ RULES:
         function newChat() {
             msgs = [];
             sessId = null;
+            currentContext = null;
             wipeUI();
             document.getElementById('welcome').style.display = 'flex';
             toast('New chat ✓');
@@ -1971,6 +2281,7 @@ function getSaved(key) {
 
 function putSaved(key, items) {
     localStorage.setItem(key, JSON.stringify(items));
+    if (cloudReady) syncCollection(key === GK ? 'gems' : 'projects', items);
     updateSavedCounts();
 }
 
@@ -2035,14 +2346,14 @@ function renderCustomItems(type) {
         return;
     }
     el.innerHTML = items.map(item => {
-        const prompt = encodeURIComponent(item.prompt);
         const id = encodeURIComponent(item.id);
         if (type === 'gem') {
             return `
     <div class="gem">
       <div class="g-nm">${esc(item.name)}</div>
       <div class="g-ds">${esc(item.desc || item.prompt.slice(0, 90))}</div>
-      <span class="g-tg" onclick="runSaved('${prompt}')">Use Gem</span>
+      <span class="g-tg" onclick="openItemChats('gem','${id}')">${countItemChats('gem', item.id)} chats</span>
+      <div class="prj-ask" onclick="startItemChat('gem','${id}')">Start new chat</div>
       <button class="hdel" style="opacity:.8;float:right" onclick="deleteCustomItem('gem','${id}')">Delete</button>
     </div>`;
         }
@@ -2050,7 +2361,8 @@ function renderCustomItems(type) {
     <div class="prj">
       <div class="prj-h">${esc(item.name)} <span class="pbadge active">Saved</span></div>
       <div class="prj-d">${esc(item.desc || item.prompt.slice(0, 100))}</div>
-      <div class="prj-ask" onclick="runSaved('${prompt}')">Ask AI for help</div>
+      <div class="prj-ask" onclick="openItemChats('project','${id}')">Open ${countItemChats('project', item.id)} chats</div>
+      <div class="prj-ask" onclick="startItemChat('project','${id}')">Start new chat</div>
       <button class="hdel" style="opacity:.8" onclick="deleteCustomItem('project','${id}')">Delete</button>
     </div>`;
     }).join('');
@@ -2060,12 +2372,51 @@ function deleteCustomItem(type, encodedId) {
     const key = type === 'gem' ? GK : PK;
     const id = decodeURIComponent(encodedId);
     putSaved(key, getSaved(key).filter(item => item.id !== id));
+    deleteCloudItem(type === 'gem' ? 'gems' : 'projects', id);
     renderCustomItems(type);
     toast('Deleted');
 }
 
-function runSaved(encodedPrompt) {
-    useGem(decodeURIComponent(encodedPrompt));
+function findSavedItem(type, encodedId) {
+    const id = decodeURIComponent(encodedId);
+    const key = type === 'gem' ? GK : PK;
+    return getSaved(key).find(item => item.id === id);
+}
+
+function countItemChats(type, id) {
+    return getSess().filter(s => s.context && s.context.type === type && s.context.id === id).length;
+}
+
+function openItemChats(type, encodedId) {
+    const item = findSavedItem(type, encodedId);
+    if (!item) return;
+    const chats = getSess().filter(s => s.context && s.context.type === type && s.context.id === item.id);
+    openP(`${esc(item.name)} <span>${type === 'gem' ? 'Gem' : 'Project'}</span>`);
+    document.getElementById('pBody').innerHTML = `
+      <div class="prj">
+        <div class="prj-h">${esc(item.name)} <span class="pbadge active">${chats.length} chats</span></div>
+        <div class="prj-d">${esc(item.desc || item.prompt)}</div>
+        <div class="prj-ask" onclick="startItemChat('${type}','${encodeURIComponent(item.id)}')">Start new chat</div>
+      </div>
+      <div id="itemChats">
+        ${chats.length ? chats.map(s => `
+          <div class="hi" onclick="closePanel();loadSess('${s.id}')">
+            <div class="hdot"></div>
+            <div class="hlbl">${esc(s.title || 'Untitled')}</div>
+          </div>`).join('') : '<div class="no-res">No chats here yet. Start the first one above.</div>'}
+      </div>`;
+}
+
+function startItemChat(type, encodedId) {
+    const item = findSavedItem(type, encodedId);
+    if (!item) return;
+    currentContext = { type, id: item.id, name: item.name };
+    sessId = 's' + Date.now();
+    msgs = [];
+    closePanel();
+    closeSB();
+    document.getElementById('ta').value = item.prompt;
+    send();
 }
 
 function hideW(){const w=document.getElementById('welcome');if(w)w.style.display='none';}
@@ -2080,7 +2431,22 @@ function toast(msg,err=false){
 }
 function esc(t){return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
-document.addEventListener('DOMContentLoaded',()=>{renderHist();updateSavedCounts();document.getElementById('ta').focus();});
+function startApp() {
+    document.documentElement.dataset.caspamReady = '1';
+    initFirebase();
+    const ta = document.getElementById('ta');
+    if (ta) ta.focus();
+}
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', startApp);
+} else {
+    startApp();
+}
+
+window.signInWithGoogle = signInWithGoogle;
+window.signOut = signOut;
+document.documentElement.dataset.caspamBootDone = '1';
     </script>
 </body>
 
