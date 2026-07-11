@@ -260,11 +260,11 @@ def asks_about_uploaded_notes(query):
     )
 
 
-def uploaded_document_status_context(user_id, query, document_context):
+def uploaded_document_status_context(user_id, query, document_context, chat_id=None):
     if document_context or not asks_about_uploaded_notes(query):
         return ""
 
-    docs = list_documents(user_id)
+    docs = list_documents(user_id, chat_id)
     if not docs:
         return (
             "The student is asking about uploaded lecture notes, but no uploaded documents "
@@ -472,8 +472,14 @@ def chat():
         )
 
     website_context = build_website_context(latest_user_message)
-    document_context, sources = rag_context(user_id, latest_user_message)
-    upload_status_context = uploaded_document_status_context(user_id, latest_user_message, document_context)
+    document_context, sources = rag_context(user_id, latest_user_message, chat_id)
+    has_text_source = any(source.get("chunk") for source in sources)
+    upload_status_context = uploaded_document_status_context(
+        user_id,
+        latest_user_message,
+        document_context if has_text_source else "",
+        chat_id,
+    )
     combined_context = "\n\n---\n\n".join(part for part in [website_context, document_context, upload_status_context] if part)
     context_prompt = context_message(combined_context)
 
@@ -546,18 +552,21 @@ def profile_get():
 @app.post("/api/upload")
 def upload():
     user_id = get_user_id(request)
-    if "file" not in request.files:
+    files = request.files.getlist("files") or request.files.getlist("file")
+    if not files:
         return jsonify({"error": "No file uploaded."}), 400
     try:
-        doc = save_document(user_id, request.files["file"])
-        return jsonify({"document": doc, "documents": list_documents(user_id)})
+        chat_id = clean_text(request.form.get("chat_id", ""))[:128]
+        docs = [save_document(user_id, file, chat_id) for file in files if file and file.filename]
+        return jsonify({"document": docs[0] if docs else None, "documents": list_documents(user_id, chat_id), "uploaded": docs})
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
 
 @app.get("/api/documents")
 def documents():
-    return jsonify({"documents": list_documents(get_user_id(request))})
+    chat_id = clean_text(request.args.get("chat_id", ""))[:128]
+    return jsonify({"documents": list_documents(get_user_id(request), chat_id or None)})
 
 
 @app.get("/api/dashboard")
