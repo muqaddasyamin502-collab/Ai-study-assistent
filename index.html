@@ -2200,7 +2200,10 @@ RULES:
                     });
                     const data = await readJson(response);
                     if (!response.ok) toast(data.error || 'Upload failed', true);
-                    else toast(`Uploaded ${file.name}`);
+                    else {
+                        const chars = data.document && Number(data.document.text_chars || 0);
+                        toast(chars ? `Uploaded ${file.name} (${chars} text chars)` : `Uploaded ${file.name}, but no readable text found`, !chars);
+                    }
                 } catch (err) {
                     toast(`Upload connection failed. Open ${API_BASE || window.location.origin}`, true);
                 }
