@@ -242,6 +242,47 @@ def context_message(website_context):
     )
 
 
+def asks_about_uploaded_notes(query):
+    q = query.lower()
+    return any(
+        phrase in q
+        for phrase in [
+            "uploaded",
+            "lecture note",
+            "lecture notes",
+            "my notes",
+            "notes",
+            "document",
+            "pdf",
+            "summarize",
+            "summary",
+        ]
+    )
+
+
+def uploaded_document_status_context(user_id, query, document_context):
+    if document_context or not asks_about_uploaded_notes(query):
+        return ""
+
+    docs = list_documents(user_id)
+    if not docs:
+        return (
+            "The student is asking about uploaded lecture notes, but no uploaded documents "
+            "are available for this user. Ask them to upload notes with the plus button first."
+        )
+
+    listed = "\n".join(
+        f"- {doc.get('filename', 'uploaded file')} ({doc.get('text_chars', 0)} extracted text characters)"
+        for doc in docs[:5]
+    )
+    return (
+        "The student has uploaded document files, but no searchable text was extracted from them. "
+        "Do not say that no files were uploaded. Explain that the uploaded file may be scanned, image-only, "
+        "or unreadable on the server, and ask for a text-based PDF, DOCX, TXT, or pasted text.\n\n"
+        f"Uploaded documents:\n{listed}"
+    )
+
+
 def call_groq(messages, context_prompt, system_prompt=None):
     if not GROQ_API_KEY:
         raise RuntimeError("Groq API key is missing.")
@@ -432,7 +473,8 @@ def chat():
 
     website_context = build_website_context(latest_user_message)
     document_context, sources = rag_context(user_id, latest_user_message)
-    combined_context = "\n\n---\n\n".join(part for part in [website_context, document_context] if part)
+    upload_status_context = uploaded_document_status_context(user_id, latest_user_message, document_context)
+    combined_context = "\n\n---\n\n".join(part for part in [website_context, document_context, upload_status_context] if part)
     context_prompt = context_message(combined_context)
 
     try:
