@@ -14,15 +14,27 @@ from html.parser import HTMLParser
 from pathlib import Path
 from xml.etree import ElementTree
 
+import requests
+
 
 DATA_DIR = Path(os.getenv("CASPAM_DATA_DIR", "instance")).resolve()
 DB_PATH = DATA_DIR / "caspam.db"
 UPLOAD_DIR = DATA_DIR / "uploads"
 BACKUP_DIR = DATA_DIR / "backups"
 
-ALLOWED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".txt", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+ALLOWED_EXTENSIONS = {
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".ppt", ".pptx", ".txt",
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp",
+    ".mp3", ".wav", ".m4a", ".ogg", ".webm", ".mp4", ".mov", ".avi", ".mkv",
+}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".ogg", ".webm"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+DOCUMENT_EXTENSIONS = ALLOWED_EXTENSIONS - IMAGE_EXTENSIONS - AUDIO_EXTENSIONS - VIDEO_EXTENSIONS
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 LATEST_PROMPT_VERSION = os.getenv("SYSTEM_PROMPT_VERSION", "2026-07-10")
+GROQ_AUDIO_TRANSCRIPTION_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_TRANSCRIPTION_MODEL = os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo")
 
 
 class TextOnlyHTMLParser(HTMLParser):
@@ -62,10 +74,14 @@ def init_db():
             create table if not exists documents (
                 id text primary key,
                 owner_id text,
+                chat_id text,
                 filename text not null,
                 content_type text,
                 path text not null,
                 text text,
+                media_kind text,
+                size_bytes integer default 0,
+                summary text,
                 created_at text not null
             );
             create table if not exists chats (
@@ -115,10 +131,27 @@ def init_db():
             );
             """
         )
+        cols = {row["name"] for row in conn.execute("pragma table_info(documents)").fetchall()}
+        migrations = {
+            "chat_id": "alter table documents add column chat_id text",
+            "media_kind": "alter table documents add column media_kind text",
+            "size_bytes": "alter table documents add column size_bytes integer default 0",
+            "summary": "alter table documents add column summary text",
+        }
+        for col, sql in migrations.items():
+            if col not in cols:
+                conn.execute(sql)
 
 
 def clean_text(text):
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def clean_env_value(value):
+    value = (value or "").strip().strip("\"'")
+    if "=" in value:
+        value = value.split("=", 1)[1].strip().strip("\"'")
+    return value
 
 
 def get_user_id(request):
@@ -211,6 +244,38 @@ def extract_pptx(raw):
     return " ".join(text)
 
 
+def extract_xlsx(raw):
+    values = []
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        shared = []
+        if "xl/sharedStrings.xml" in zf.namelist():
+            root = ElementTree.fromstring(zf.read("xl/sharedStrings.xml"))
+            for item in root.iter():
+                if item.tag.endswith("}t") and item.text:
+                    shared.append(item.text)
+        for name in sorted(n for n in zf.namelist() if n.startswith("xl/worksheets/") and n.endswith(".xml")):
+            root = ElementTree.fromstring(zf.read(name))
+            for cell in root.iter():
+                if not cell.tag.endswith("}c"):
+                    continue
+                cell_type = cell.attrib.get("t")
+                raw_value = next((child.text for child in cell if child.tag.endswith("}v") and child.text), "")
+                inline_value = " ".join(child.text for child in cell.iter() if child.tag.endswith("}t") and child.text)
+                if cell_type == "s" and raw_value.isdigit() and int(raw_value) < len(shared):
+                    values.append(shared[int(raw_value)])
+                elif inline_value:
+                    values.append(inline_value)
+                elif raw_value:
+                    values.append(raw_value)
+    return " ".join(values)
+
+
+def extract_csv(raw):
+    text = extract_txt(raw)
+    rows = csv.reader(io.StringIO(text))
+    return " ".join(" ".join(cell for cell in row if cell) for row in rows)
+
+
 def extract_pdf(raw):
     try:
         from pypdf import PdfReader
@@ -239,16 +304,62 @@ def extract_text_from_upload(filename, raw):
             return clean_text(extract_docx(raw))
         if ext == ".pptx":
             return clean_text(extract_pptx(raw))
+        if ext == ".xlsx":
+            return clean_text(extract_xlsx(raw))
+        if ext == ".csv":
+            return clean_text(extract_csv(raw))
         if ext == ".pdf":
             return clean_text(extract_pdf(raw))
-        if ext in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}:
+        if ext in IMAGE_EXTENSIONS:
             return clean_text(extract_image(raw))
     except Exception:
         return ""
     return ""
 
 
-def save_document(user_id, file_storage):
+def transcribe_media_upload(filename, raw, content_type):
+    api_key = clean_env_value(os.getenv("GROQ_API_KEY") or os.getenv("GROK_API_KEY"))
+    if not api_key:
+        return ""
+    try:
+        response = requests.post(
+            GROQ_AUDIO_TRANSCRIPTION_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            data={"model": GROQ_TRANSCRIPTION_MODEL},
+            files={"file": (filename, io.BytesIO(raw), content_type or "application/octet-stream")},
+            timeout=90,
+        )
+        if not response.ok:
+            return ""
+        data = response.json()
+        return clean_text(data.get("text", ""))
+    except Exception:
+        return ""
+
+
+def media_kind(filename):
+    ext = Path(filename).suffix.lower()
+    if ext in IMAGE_EXTENSIONS:
+        return "image"
+    if ext in AUDIO_EXTENSIONS:
+        return "audio"
+    if ext in VIDEO_EXTENSIONS:
+        return "video"
+    return "document"
+
+
+def describe_upload(filename, content_type, size_bytes, text):
+    kind = media_kind(filename)
+    if text:
+        return f"{kind.title()} file with {len(text)} extracted text characters."
+    if kind == "image":
+        return "Image file uploaded. OCR text was not available, so answer using visible context only if the user describes it."
+    if kind in {"audio", "video"}:
+        return f"{kind.title()} file uploaded. No transcript is available yet; use the filename and any user transcript or description."
+    return "Document uploaded, but no readable text was extracted."
+
+
+def save_document(user_id, file_storage, chat_id=""):
     filename = safe_filename(file_storage.filename or "upload")
     if not allowed_file(filename):
         raise ValueError("Unsupported file type.")
@@ -258,22 +369,57 @@ def save_document(user_id, file_storage):
     doc_id = uuid.uuid4().hex
     target = UPLOAD_DIR / f"{doc_id}_{filename}"
     target.write_bytes(raw)
+    kind = media_kind(filename)
     text = extract_text_from_upload(filename, raw)
+    if not text and kind in {"audio", "video"}:
+        text = transcribe_media_upload(filename, raw, file_storage.mimetype)
+    summary = describe_upload(filename, file_storage.mimetype, len(raw), text)
     with db() as conn:
         conn.execute(
-            "insert into documents values (?, ?, ?, ?, ?, ?, ?)",
-            (doc_id, user_id, filename, file_storage.mimetype, str(target), text, utc_now()),
+            """
+            insert into documents (id, owner_id, chat_id, filename, content_type, path, text, media_kind, size_bytes, summary, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (doc_id, user_id, clean_text(chat_id)[:128], filename, file_storage.mimetype, str(target), text, kind, len(raw), summary, utc_now()),
         )
-    log_activity(user_id, "document.upload", {"document_id": doc_id, "filename": filename})
-    return {"id": doc_id, "filename": filename, "text_chars": len(text), "ocr_used": Path(filename).suffix.lower() not in {".txt", ".docx", ".pptx", ".pdf"}}
+    log_activity(user_id, "document.upload", {"document_id": doc_id, "filename": filename, "chat_id": chat_id})
+    return {
+        "id": doc_id,
+        "filename": filename,
+        "content_type": file_storage.mimetype,
+        "media_kind": kind,
+        "size_bytes": len(raw),
+        "summary": summary,
+        "chat_id": clean_text(chat_id)[:128],
+        "text_chars": len(text),
+        "ocr_used": Path(filename).suffix.lower() in IMAGE_EXTENSIONS,
+    }
 
 
-def list_documents(user_id):
+def list_documents(user_id, chat_id=None):
     with db() as conn:
-        rows = conn.execute(
-            "select id, filename, content_type, length(coalesce(text,'')) as text_chars, created_at from documents where owner_id in (?, 'shared') order by created_at desc",
-            (user_id,),
-        ).fetchall()
+        if chat_id:
+            rows = conn.execute(
+                """
+                select id, chat_id, filename, content_type, media_kind, size_bytes, summary,
+                       length(coalesce(text,'')) as text_chars, created_at
+                from documents
+                where owner_id in (?, 'shared') and (chat_id = ? or owner_id = 'shared')
+                order by created_at desc
+                """,
+                (user_id, chat_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                select id, chat_id, filename, content_type, media_kind, size_bytes, summary,
+                       length(coalesce(text,'')) as text_chars, created_at
+                from documents
+                where owner_id in (?, 'shared')
+                order by created_at desc
+                """,
+                (user_id,),
+            ).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -289,12 +435,22 @@ def score_text(query, text):
     return sum(words.get(word, 0) * weight for word, weight in q.items())
 
 
-def best_document_chunks(user_id, query, limit=5):
+def best_document_chunks(user_id, query, chat_id=None, limit=5):
     with db() as conn:
-        rows = conn.execute(
-            "select id, filename, text, created_at from documents where owner_id in (?, 'shared') and coalesce(text,'') != '' order by created_at desc",
-            (user_id,),
-        ).fetchall()
+        if chat_id:
+            rows = conn.execute(
+                """
+                select id, filename, text, created_at from documents
+                where owner_id in (?, 'shared') and (chat_id = ? or owner_id = 'shared') and coalesce(text,'') != ''
+                order by created_at desc
+                """,
+                (user_id, chat_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "select id, filename, text, created_at from documents where owner_id in (?, 'shared') and coalesce(text,'') != '' order by created_at desc",
+                (user_id,),
+            ).fetchall()
     scored = []
     for row in rows:
         text = row["text"] or ""
@@ -333,15 +489,37 @@ def best_document_chunks(user_id, query, limit=5):
     return fallback
 
 
-def rag_context(user_id, query):
-    chunks = best_document_chunks(user_id, query)
-    if not chunks:
+def attachment_context(user_id, chat_id):
+    docs = list_documents(user_id, chat_id) if chat_id else []
+    if not docs:
         return "", []
+    lines = []
+    sources = []
+    for doc in docs[:12]:
+        text_chars = doc.get("text_chars", 0)
+        readability = (
+            "Readable text is available."
+            if text_chars
+            else "No readable text was extracted. If the user asks to summarize or answer from this file, say the file is attached but appears scanned/image-only/unreadable on the server; ask for a text-based PDF, OCR copy, or pasted text."
+        )
+        lines.append(
+            f"- {doc.get('filename')} ({doc.get('media_kind') or 'file'}, {text_chars} text chars): {doc.get('summary') or ''} {readability}"
+        )
+        sources.append({"document_id": doc.get("id"), "title": doc.get("filename"), "kind": doc.get("media_kind")})
+    return "Files attached to this conversation:\n" + "\n".join(lines), sources
+
+
+def rag_context(user_id, query, chat_id=None):
+    chunks = best_document_chunks(user_id, query, chat_id)
+    file_context, file_sources = attachment_context(user_id, chat_id)
+    if not chunks:
+        return file_context, file_sources
     context = "\n\n".join(
         f"Document: {c['title']} (chunk {c['chunk']})\n{c['content']}" for c in chunks
     )
     sources = [{"document_id": c["document_id"], "title": c["title"], "chunk": c["chunk"]} for c in chunks]
-    return "Use these uploaded document excerpts when relevant and cite them by document title and chunk.\n\n" + context, sources
+    full_context = "\n\n".join(part for part in [file_context, "Use these uploaded document excerpts when relevant and cite them by document title and chunk.\n\n" + context] if part)
+    return full_context, [*file_sources, *sources]
 
 
 def create_or_update_chat(user_id, chat_id, title, messages, system_prompt, prompt_version, metadata=None):
@@ -490,7 +668,7 @@ def restore_data(user_id, role, payload):
         raise PermissionError("Only admins can restore backups.")
     allowed = {
         "profiles": {"user_id", "email", "display_name", "role", "preferences", "updated_at"},
-        "documents": {"id", "owner_id", "filename", "content_type", "path", "text", "created_at"},
+        "documents": {"id", "owner_id", "chat_id", "filename", "content_type", "path", "text", "media_kind", "size_bytes", "summary", "created_at"},
         "chats": {"id", "owner_id", "title", "role", "prompt_version", "system_prompt", "pinned", "bookmarked", "metadata", "created_at", "updated_at"},
         "messages": {"id", "chat_id", "role", "content", "sources", "created_at"},
         "activity_logs": {"id", "user_id", "action", "details", "created_at"},
