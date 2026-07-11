@@ -1191,6 +1191,12 @@
             color: var(--t1);
             border-color: var(--bd2)
         }
+
+        .act.on {
+            color: var(--green);
+            border-color: rgba(52, 211, 153, .45);
+            background: rgba(52, 211, 153, .1)
+        }
         /* Typing */
         
         #typing {
@@ -1672,9 +1678,9 @@
         </main>
     </div>
 
-    <script async src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
-    <script async src="https://www.gstatic.com/firebasejs/10.12.5/firebase-auth-compat.js"></script>
-    <script async src="https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore-compat.js"></script>
     <script>
         document.documentElement.dataset.caspamStarted = '1';
 
@@ -1688,6 +1694,10 @@
         let db = null;
         let cloudReady = false;
         let currentContext = null;
+        let currentRole = localStorage.getItem('caspam_role') || 'student';
+        let lastSuggestions = [];
+        let lastSources = [];
+        let firebaseConfig = null;
 
         const SYS = `You are CASPAM-Bot, the official AI assistant for CASPAM (Centre for Advanced Studies in Pure and Applied Mathematics), BZU Multan, Pakistan.
 
@@ -1734,6 +1744,7 @@ RULES:
                 }
 
                 document.documentElement.dataset.firebaseStep = 'sdk-ready';
+                firebaseConfig = data.config;
                 firebase.initializeApp(data.config);
                 document.documentElement.dataset.firebaseStep = 'app-initialized';
                 db = firebase.firestore();
@@ -1771,7 +1782,7 @@ RULES:
         function getFirebaseConfig() {
             return new Promise((resolve, reject) => {
                 const xhr = new XMLHttpRequest();
-                xhr.open('GET', '/api/firebase-config', true);
+                xhr.open('GET', `${API_BASE}/api/firebase-config`, true);
                 xhr.onload = () => {
                     try {
                         resolve(JSON.parse(xhr.responseText || '{}'));
@@ -1802,6 +1813,17 @@ RULES:
 
         function userCollection(name) {
             return db.collection('users').doc(currentUser.uid).collection(name);
+        }
+
+        function authHeaders(extra = {}) {
+            const headers = {...extra
+            };
+            if (currentUser) {
+                headers['X-User-Id'] = currentUser.uid;
+                headers['X-User-Email'] = currentUser.email || '';
+            }
+            headers['X-User-Role'] = currentRole;
+            return headers;
         }
 
         async function loadCloudData() {
@@ -1852,19 +1874,60 @@ RULES:
             }
         }
 
-        function signInWithGoogle() {
+        async function signInWithGoogle() {
+            const note = document.getElementById('authNote');
             if (!cloudReady || !window.firebase) {
-                toast('Google sync is still loading. Refresh and try again.', true);
-                return;
+                if (note) note.textContent = 'Google login is loading. Please wait a moment...';
+                if (!await waitForFirebaseSdk(12000)) {
+                    const msg = 'Google login library could not load. Check internet connection and refresh.';
+                    if (note) note.textContent = msg;
+                    toast(msg, true);
+                    return;
+                }
+                cloudReady = true;
+            }
+            if (!firebase.apps.length) {
+                const data = firebaseConfig ? { enabled: true, config: firebaseConfig } : await getFirebaseConfig();
+                if (!data.enabled) {
+                    const msg = 'Firebase is not configured yet. Local mode is active.';
+                    if (note) note.textContent = msg;
+                    toast(msg, true);
+                    return;
+                }
+                firebaseConfig = data.config;
+                firebase.initializeApp(data.config);
+                db = firebase.firestore();
             }
             const provider = new firebase.auth.GoogleAuthProvider();
+            provider.setCustomParameters({ prompt: 'select_account' });
+            firebase.auth().useDeviceLanguage();
             firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL)
                 .then(() => firebase.auth().signInWithPopup(provider))
                 .catch(err => {
-                    const note = document.getElementById('authNote');
-                    if (note) note.textContent = err.message;
-                    toast(err.message, true);
+                    if (err && (err.code === 'auth/popup-blocked' || err.code === 'auth/popup-closed-by-user' || err.code === 'auth/cancelled-popup-request')) {
+                        return firebase.auth().signInWithRedirect(provider);
+                    }
+                    const msg = err && err.code === 'auth/unauthorized-domain'
+                        ? 'Firebase Google login needs this domain added in Firebase Auth authorized domains.'
+                        : (err.message || 'Google login failed.');
+                    if (note) note.textContent = msg;
+                    toast(msg, true);
                 });
+        }
+
+        function signInWithEmail() {
+            if (!cloudReady || !window.firebase) {
+                toast('Email login is still loading. Refresh and try again.', true);
+                return;
+            }
+            const email = prompt('Email address');
+            if (!email) return;
+            const password = prompt('Password');
+            if (!password) return;
+            firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL)
+                .then(() => firebase.auth().signInWithEmailAndPassword(email, password))
+                .catch(() => firebase.auth().createUserWithEmailAndPassword(email, password))
+                .catch(err => toast(err.message, true));
         }
 
         function signOut() {
@@ -1876,12 +1939,13 @@ RULES:
             if (!pill) return;
             if (!user) {
                 pill.style.display = 'flex';
-                pill.innerHTML = `<span>Local only</span><button class="link-btn" onclick="signInWithGoogle()">Sign in to sync</button>`;
+                pill.innerHTML = `<span>Local only</span><button class="link-btn" onclick="signInWithGoogle()">Google</button><button class="link-btn" onclick="signInWithEmail()">Email</button>`;
                 return;
             }
             const photo = user.photoURL ? `<img src="${esc(user.photoURL)}" alt="">` : '';
             pill.style.display = 'flex';
-            pill.innerHTML = `${photo}<span>${esc(user.displayName || user.email || 'Student')}</span><button class="link-btn" onclick="signOut()">Logout</button>`;
+            pill.innerHTML = `${photo}<span>${esc(user.displayName || user.email || 'Student')}</span><button class="link-btn" onclick="openProfile()">Profile</button><button class="link-btn" onclick="signOut()">Logout</button>`;
+            saveProfile();
         }
 
         function getSess() {
@@ -1899,14 +1963,18 @@ RULES:
 
         function saveSess(first) {
             if (!sessId) return;
-            const all = getSess();
+            const all = getSess().sort((a, b) => (b.pinned === true) - (a.pinned === true) || (b.ts || 0) - (a.ts || 0));
             const i = all.findIndex(s => s.id === sessId);
+            const old = i >= 0 ? all[i] : {};
             const o = {
                 id: sessId,
                 title: first,
                 ts: Date.now(),
                 msgs,
-                context: currentContext
+                context: currentContext,
+                pinned: !!old.pinned,
+                bookmarked: !!old.bookmarked,
+                promptVersion: old.promptVersion || null
             };
             if (i >= 0) all[i] = o;
             else all.unshift(o);
@@ -1963,27 +2031,54 @@ RULES:
 
         // ── CLAUDE API ────────────────────────────────
 
-        const API_BASE = window.location.port === '5500' ? 'http://127.0.0.1:5000' : '';
+        const API_BASE = (() => {
+            const host = window.location.hostname;
+            const isLocal = host === '127.0.0.1' || host === 'localhost' || host === '';
+            const isBackend = window.location.port === '5000';
+            return (window.location.protocol === 'file:' || (isLocal && !isBackend))
+                ? 'http://127.0.0.1:5000'
+                : '';
+        })();
+
+        function backendUrl() {
+            return API_BASE || window.location.origin;
+        }
 
         async function readJson(response) {
             const text = await response.text();
             try {
                 return text ? JSON.parse(text) : {};
             } catch {
-                throw new Error(`Backend returned invalid JSON. Make sure Flask is running at ${API_BASE || window.location.origin}`);
+                throw new Error(`Backend returned invalid JSON. Open ${backendUrl()} and try again.`);
             }
         }
 
         async function callClaude(messages) {
-            const response = await fetch(`${API_BASE}/api/chat`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    messages: messages
-                })
-            });
+            const title = messages[0] && messages[0].content ? messages[0].content.slice(0, 40) : 'Untitled';
+            const existingSession = getSess().find(s => s.id === sessId);
+            const legacyChat = !!(existingSession && existingSession.promptVersion == null && (existingSession.msgs || []).length > 1);
+            let response;
+            try {
+                response = await fetch(`${API_BASE}/api/chat`, {
+                    method: 'POST',
+                    headers: {
+                        ...authHeaders(),
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        chat_id: sessId,
+                        title,
+                        messages: messages,
+                        metadata: {
+                            context: currentContext,
+                            legacy_chat: legacyChat,
+                            system_prompt: legacyChat ? SYS : null
+                        }
+                    })
+                });
+            } catch (err) {
+                throw new Error(`Cannot reach backend. Open ${backendUrl()} and make sure app.py is running.`);
+            }
 
             const data = await readJson(response);
 
@@ -1992,7 +2087,269 @@ RULES:
                 throw new Error(data.error || detail || 'API Error: ' + response.status);
             }
 
-            return data.reply;
+            lastSuggestions = data.suggested || [];
+            lastSources = data.sources || [];
+            applyPromptVersion(data.prompt_version);
+            renderSuggestions();
+            return withSources(data.reply || '', lastSources);
+        }
+
+        function applyPromptVersion(version) {
+            if (!sessId || !version) return;
+            const all = getSess();
+            const i = all.findIndex(s => s.id === sessId);
+            if (i >= 0) {
+                all[i].promptVersion = all[i].promptVersion || version;
+                putSess(all);
+            }
+        }
+
+        function withSources(text, sources) {
+            if (!sources || !sources.length) return text;
+            const lines = sources.map((s, i) => `${i + 1}. ${s.title || 'Document'}${s.chunk ? ' · chunk ' + s.chunk : ''}`);
+            return `${text}\n\n**Sources**\n${lines.join('\n')}`;
+        }
+
+        async function saveProfile() {
+            if (!currentUser) return;
+            try {
+                await fetch(`${API_BASE}/api/profile`, {
+                    method: 'POST',
+                    headers: {...authHeaders(),
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        email: currentUser.email || '',
+                        display_name: currentUser.displayName || '',
+                        role: currentRole,
+                        preferences: {
+                            voice: !!localStorage.getItem('caspam_voice_out')
+                        }
+                    })
+                });
+            } catch {}
+        }
+
+        async function openProfile() {
+            openP('Profile');
+            document.getElementById('pBody').innerHTML = `
+      <div class="prj">
+        <div class="prj-h">${esc((currentUser && (currentUser.displayName || currentUser.email)) || 'Local user')}</div>
+        <div class="prj-d">Role</div>
+        <select class="s-inp" id="rolePick" onchange="setRole(this.value)">
+          <option value="student">student</option><option value="teacher">teacher</option><option value="admin">admin</option>
+        </select>
+        <div class="prj-ask" onclick="openDashboard()">Open dashboard</div>
+        <div class="prj-ask" onclick="openActivity()">Activity logs</div>
+        <div class="prj-ask" onclick="exportCurrentChat()">Export current chat</div>
+        <div class="prj-ask" onclick="backupNow()">Backup</div>
+      </div>`;
+            const pick = document.getElementById('rolePick');
+            if (pick) pick.value = currentRole;
+        }
+
+        function setRole(role) {
+            currentRole = role;
+            localStorage.setItem('caspam_role', role);
+            saveProfile();
+            toast('Role saved');
+        }
+
+        async function openDashboard() {
+            const data = await fetch(`${API_BASE}/api/dashboard`, {
+                headers: authHeaders()
+            }).then(readJson);
+            openP(`${esc(data.role || currentRole)} Dashboard`);
+            document.getElementById('pBody').innerHTML = `
+      ${(data.cards || []).map(card => `<div class="prj"><div class="prj-h">${esc(card.label)} <span class="pbadge active">${card.value}</span></div></div>`).join('')}
+      ${(data.notifications || []).map(n => `<div class="disc"><div><div class="d-nm">Notification</div><div class="d-sb">${esc(n.message)}</div></div></div>`).join('')}
+      <div class="prj-ask" onclick="openAnalytics()">Analytics</div>`;
+        }
+
+        async function openAnalytics() {
+            const data = await fetch(`${API_BASE}/api/analytics`, { headers: authHeaders() }).then(readJson);
+            openP('Analytics');
+            document.getElementById('pBody').innerHTML = (data.events || []).map(e =>
+                `<div class="hi"><div class="hdot"></div><div class="hlbl">${esc(e.action)} · ${e.count}</div></div>`
+            ).join('') || '<div class="no-res">No analytics yet.</div>';
+        }
+
+        async function openActivity() {
+            const data = await fetch(`${API_BASE}/api/activity`, { headers: authHeaders() }).then(readJson);
+            openP('Activity');
+            document.getElementById('pBody').innerHTML = (data.activity || []).map(e =>
+                `<div class="hi"><div class="hdot"></div><div class="hlbl">${esc(e.action)} · ${esc(e.created_at || '')}</div></div>`
+            ).join('') || '<div class="no-res">No activity yet.</div>';
+        }
+
+        async function backupNow() {
+            const data = await fetch(`${API_BASE}/api/backup`, { method: 'POST', headers: authHeaders() }).then(readJson);
+            toast(data.error || 'Backup created');
+        }
+
+        async function uploadFiles(files) {
+            if (!files || !files.length) return;
+            for (const file of files) {
+                try {
+                    const form = new FormData();
+                    form.append('file', file);
+                    const response = await fetch(`${API_BASE}/api/upload`, {
+                        method: 'POST',
+                        headers: authHeaders(),
+                        body: form
+                    });
+                    const data = await readJson(response);
+                    if (!response.ok) toast(data.error || 'Upload failed', true);
+                    else toast(`Uploaded ${file.name}`);
+                } catch (err) {
+                    toast(`Upload connection failed. Open ${API_BASE || window.location.origin}`, true);
+                }
+            }
+        }
+
+        async function exportCurrentChat() {
+            if (!sessId) {
+                toast('Open a chat first', true);
+                return;
+            }
+            const response = await fetch(`${API_BASE}/api/chats/${encodeURIComponent(sessId)}/export?format=md`, { headers: authHeaders() });
+            if (!response.ok) {
+                const s = getSess().find(x => x.id === sessId);
+                const text = ['# ' + (s && s.title || 'CASPAM Chat'), '', ...(msgs || []).map(m => `## ${m.role}\n${m.content}\n`)].join('\n');
+                downloadText(`caspam-chat-${sessId}.md`, text, 'text/markdown');
+                return;
+            }
+            downloadText(`caspam-chat-${sessId}.md`, await response.text(), 'text/markdown');
+        }
+
+        function downloadText(filename, text, type) {
+            const url = URL.createObjectURL(new Blob([text], { type }));
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        function setCurrentChatFlag(flag) {
+            if (!sessId) return toast('Open a chat first', true);
+            const all = getSess();
+            const i = all.findIndex(s => s.id === sessId);
+            if (i >= 0) {
+                all[i][flag] = !all[i][flag];
+                putSess(all);
+                fetch(`${API_BASE}/api/chats/${encodeURIComponent(sessId)}/flags`, {
+                    method: 'PATCH',
+                    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ [flag]: all[i][flag] })
+                }).catch(() => {});
+                renderHist();
+                toast(flag === 'pinned' ? 'Pin updated' : 'Bookmark updated');
+            }
+        }
+
+        function renderSuggestions() {
+            const old = document.getElementById('suggestedFollowups');
+            if (old) old.remove();
+            if (!lastSuggestions.length) return;
+            const chat = document.getElementById('chat');
+            const typing = document.getElementById('typing');
+            const wrap = document.createElement('div');
+            wrap.id = 'suggestedFollowups';
+            wrap.className = 'm-acts';
+            wrap.style.marginLeft = '54px';
+            lastSuggestions.slice(0, 3).forEach(q => {
+                const b = document.createElement('button');
+                b.className = 'act';
+                b.textContent = q;
+                b.onclick = () => sq(q);
+                wrap.appendChild(b);
+            });
+            chat.insertBefore(wrap, typing);
+        }
+
+        function speakText(text) {
+            if (!window.speechSynthesis) return toast('Voice output is not supported here', true);
+            speechSynthesis.cancel();
+            speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+        }
+
+        function startVoiceInput() {
+            if (!window.isSecureContext) {
+                return toast('Mic needs localhost or HTTPS. Open http://127.0.0.1:5000', true);
+            }
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!SpeechRecognition) return toast('Voice input is supported in Chrome/Edge. Please use one of those browsers.', true);
+            const micBtn = document.getElementById('micBtn');
+            const rec = new SpeechRecognition();
+            rec.lang = navigator.language || 'en-US';
+            rec.interimResults = false;
+            rec.maxAlternatives = 1;
+            rec.onstart = () => {
+                if (micBtn) micBtn.classList.add('on');
+                toast('Listening...');
+            };
+            rec.onresult = e => {
+                document.getElementById('ta').value = e.results[0][0].transcript;
+                resize(document.getElementById('ta'));
+                toast('Voice added');
+            };
+            rec.onerror = e => {
+                const reason = e.error === 'not-allowed'
+                    ? 'Microphone permission is blocked. Allow mic access in browser settings.'
+                    : `Mic error: ${e.error || 'permission denied'}`;
+                toast(reason, true);
+            };
+            rec.onend = () => {
+                if (micBtn) micBtn.classList.remove('on');
+            };
+            try {
+                rec.start();
+            } catch (err) {
+                if (micBtn) micBtn.classList.remove('on');
+                toast('Mic could not start. Please try again.', true);
+            }
+        }
+
+        function installFeatureControls() {
+            const row = document.querySelector('.irow');
+            if (row && !document.getElementById('filePick')) {
+                const file = document.createElement('input');
+                file.type = 'file';
+                file.id = 'filePick';
+                file.multiple = true;
+                file.accept = '.pdf,.docx,.pptx,.txt,image/*';
+                file.style.display = 'none';
+                file.onchange = e => uploadFiles(e.target.files);
+                row.insertBefore(file, document.getElementById('ta'));
+                const upload = document.createElement('button');
+                upload.id = 'uploadBtn';
+                upload.className = 'act';
+                upload.textContent = '+';
+                upload.onclick = () => file.click();
+                row.insertBefore(upload, document.getElementById('ta'));
+                const mic = document.createElement('button');
+                mic.id = 'micBtn';
+                mic.className = 'act';
+                mic.type = 'button';
+                mic.title = 'Voice input';
+                mic.textContent = 'Mic';
+                mic.onclick = startVoiceInput;
+                row.insertBefore(mic, document.getElementById('ta'));
+            }
+            const toolbar = document.getElementById('tb');
+            if (toolbar && !document.getElementById('featureTools')) {
+                const tools = document.createElement('div');
+                tools.id = 'featureTools';
+                tools.style.display = 'flex';
+                tools.style.gap = '8px';
+                tools.innerHTML = `
+          <button class="tb-btn" onclick="openDashboard()">Dashboard</button>
+          <button class="tb-btn" onclick="setCurrentChatFlag('pinned')">Pin</button>
+          <button class="tb-btn" onclick="setCurrentChatFlag('bookmarked')">Bookmark</button>
+          <button class="tb-btn" onclick="exportCurrentChat()">Export</button>`;
+                toolbar.appendChild(tools);
+            }
         }
         // Add web search function to frontend
         async function searchWeb(query) {
@@ -2037,7 +2394,7 @@ RULES:
                 saveSess(msgs[0].content.slice(0, 40) + (msgs[0].content.length > 40 ? '…' : ''));
             } catch (e) {
                 showT(false);
-                addMsg('bot', '**Connection error.** Please try again.\n\n`' + e.message + '`');
+                addMsg('bot', '**Connection problem.** ' + e.message);
             }
             document.getElementById('sBtn').disabled = false;
         }
@@ -2071,6 +2428,11 @@ RULES:
                     setTimeout(() => cp.textContent = '⎘ Copy', 2000)
                 });
                 acts.appendChild(cp);
+                const sp = document.createElement('button');
+                sp.className = 'act';
+                sp.textContent = 'Speak';
+                sp.onclick = () => speakText(text);
+                acts.appendChild(sp);
                 col.appendChild(acts);
             }
             wrap.appendChild(av);
@@ -2433,6 +2795,7 @@ function esc(t){return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g
 
 function startApp() {
     document.documentElement.dataset.caspamReady = '1';
+    installFeatureControls();
     initFirebase();
     const ta = document.getElementById('ta');
     if (ta) ta.focus();
@@ -2445,6 +2808,7 @@ if (document.readyState === 'loading') {
 }
 
 window.signInWithGoogle = signInWithGoogle;
+window.signInWithEmail = signInWithEmail;
 window.signOut = signOut;
 document.documentElement.dataset.caspamBootDone = '1';
     </script>
