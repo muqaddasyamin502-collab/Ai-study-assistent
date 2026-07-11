@@ -1324,6 +1324,189 @@
             height: 16px;
             fill: #fff
         }
+
+        .tool-btn {
+            width: 36px;
+            height: 36px;
+            border: 1px solid var(--bd);
+            background: rgba(79, 142, 247, .06);
+            color: var(--t1);
+            border-radius: 9px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            flex-shrink: 0;
+            font-size: 16px;
+            transition: var(--ease)
+        }
+
+        .tool-btn svg {
+            width: 18px;
+            height: 18px;
+            fill: none;
+            stroke: currentColor;
+            stroke-width: 2;
+            stroke-linecap: round;
+            stroke-linejoin: round
+        }
+
+        .tool-btn:hover,
+        .tool-btn.on {
+            color: var(--blue);
+            border-color: var(--bd2);
+            background: rgba(79, 142, 247, .12)
+        }
+
+        #composerStack {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            flex: 1;
+            min-width: 0
+        }
+
+        #attachmentTray,
+        .msg-files {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px
+        }
+
+        #attachmentTray:empty {
+            display: none
+        }
+
+        .att-card {
+            width: min(220px, 100%);
+            border: 1px solid var(--bd);
+            background: rgba(17, 20, 34, .88);
+            border-radius: 10px;
+            padding: 8px;
+            display: grid;
+            grid-template-columns: 34px 1fr auto;
+            gap: 8px;
+            align-items: center;
+            min-width: 0
+        }
+
+        .att-ico {
+            width: 34px;
+            height: 34px;
+            border-radius: 8px;
+            background: rgba(45, 212, 191, .08);
+            color: var(--teal);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            overflow: hidden
+        }
+
+        .att-ico img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover
+        }
+
+        .att-meta {
+            min-width: 0
+        }
+
+        .att-name,
+        .att-sub {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap
+        }
+
+        .att-name {
+            color: var(--t0);
+            font-size: 12px;
+            font-weight: 700
+        }
+
+        .att-sub {
+            color: var(--t2);
+            font: 10px 'JetBrains Mono', monospace;
+            margin-top: 2px
+        }
+
+        .att-x {
+            border: none;
+            background: transparent;
+            color: var(--t2);
+            cursor: pointer;
+            font-size: 14px
+        }
+
+        .att-progress {
+            grid-column: 1 / -1;
+            height: 3px;
+            background: var(--bg3);
+            border-radius: 99px;
+            overflow: hidden
+        }
+
+        .att-progress span {
+            display: block;
+            height: 100%;
+            width: 0;
+            background: linear-gradient(90deg, var(--blue), var(--teal))
+        }
+
+        .rec-panel {
+            display: none;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+            border: 1px solid rgba(244, 63, 94, .22);
+            background: rgba(244, 63, 94, .06);
+            border-radius: 10px;
+            padding: 7px 9px;
+            color: var(--t1);
+            font-size: 11px
+        }
+
+        .rec-panel.show {
+            display: flex
+        }
+
+        .rec-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--rose);
+            box-shadow: 0 0 12px rgba(244, 63, 94, .65)
+        }
+
+        .rec-mini {
+            border: 1px solid var(--bd);
+            background: var(--bg2);
+            color: var(--t1);
+            border-radius: 7px;
+            padding: 5px 8px;
+            cursor: pointer;
+            font: 10px 'JetBrains Mono', monospace
+        }
+
+        #dropZone {
+            position: fixed;
+            inset: 0;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 4000;
+            background: rgba(7, 8, 15, .76);
+            border: 2px dashed rgba(79, 142, 247, .65);
+            color: var(--t0);
+            font: 700 22px 'Syne', sans-serif;
+            backdrop-filter: blur(8px)
+        }
+
+        #dropZone.show {
+            display: flex
+        }
         
         .ihint {
             margin-top: 6px;
@@ -1533,6 +1716,7 @@
 
 <body>
     <div id="toast"></div>
+    <div id="dropZone">Drop files to attach them</div>
     <div id="ov" onclick="closeSB()"></div>
 
     <div id="authGate">
@@ -1668,7 +1852,28 @@
 
             <div id="ibar">
                 <div class="irow">
-                    <textarea id="ta" rows="1" placeholder=" Ask anything you want to ask " onkeydown="onKey(event)" oninput="resize(this)"></textarea>
+                    <input id="filePick" type="file" multiple style="display:none" accept=".pdf,.doc,.docx,.xls,.xlsx,.csv,.ppt,.pptx,.txt,image/*,audio/*,video/*" />
+                    <button id="uploadBtn" class="tool-btn" type="button" title="Attach files" onclick="document.getElementById('filePick').click()">+</button>
+                    <button id="micBtn" class="tool-btn" type="button" title="Start voice input" aria-label="Start voice input" onclick="startVoiceInput()">
+                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Z"></path>
+                            <path d="M19 11a7 7 0 0 1-14 0"></path>
+                            <path d="M12 18v4"></path>
+                            <path d="M8 22h8"></path>
+                        </svg>
+                    </button>
+                    <div id="composerStack">
+                        <div id="attachmentTray"></div>
+                        <div id="recPanel" class="rec-panel">
+                            <span class="rec-dot"></span>
+                            <span id="recStatus">Listening</span>
+                            <button class="rec-mini" type="button" onclick="pauseVoiceInput()">Pause</button>
+                            <button class="rec-mini" type="button" onclick="resumeVoiceInput()">Resume</button>
+                            <button class="rec-mini" type="button" onclick="cancelVoiceInput()">Cancel</button>
+                            <button class="rec-mini" type="button" onclick="toggleSpeechLang()">EN/UR</button>
+                        </div>
+                        <textarea id="ta" rows="1" placeholder=" Ask anything you want to ask " onkeydown="onKey(event)" oninput="resize(this)"></textarea>
+                    </div>
                     <button id="sBtn" onclick="send()">
           <svg viewBox="0 0 24 24"><path d="M2 21L23 12 2 3v7l15 2-15 2z"/></svg>
         </button>
@@ -1698,6 +1903,14 @@
         let lastSuggestions = [];
         let lastSources = [];
         let firebaseConfig = null;
+        let draftAttachments = [];
+        let speechRec = null;
+        let speechStream = null;
+        let speechPaused = false;
+        let speechPauseRequested = false;
+        let speechLang = localStorage.getItem('caspam_speech_lang') || 'en-US';
+        let silenceTimer = null;
+        let activeUtterance = null;
 
         const SYS = `You are CASPAM-Bot, the official AI assistant for CASPAM (Centre for Advanced Studies in Pure and Applied Mathematics), BZU Multan, Pakistan.
 
@@ -1990,7 +2203,7 @@ RULES:
             currentContext = s.context || null;
             wipeUI();
             document.getElementById('welcome').style.display = 'none';
-            msgs.forEach(m => addMsg(m.role === 'user' ? 'user' : 'bot', m.content, true));
+            msgs.forEach(m => addMsg(m.role === 'user' ? 'user' : 'bot', m.content, true, m.attachments || []));
             renderHist();
             closeSB();
         }
@@ -2034,8 +2247,8 @@ RULES:
         const API_BASE = (() => {
             const host = window.location.hostname;
             const isLocal = host === '127.0.0.1' || host === 'localhost' || host === '';
-            const isBackend = window.location.port === '5000';
-            return (window.location.protocol === 'file:' || (isLocal && !isBackend))
+            const isServedByBackend = isLocal && !!window.location.port;
+            return (window.location.protocol === 'file:' || (isLocal && !isServedByBackend))
                 ? 'http://127.0.0.1:5000'
                 : '';
         })();
@@ -2187,27 +2400,125 @@ RULES:
             toast(data.error || 'Backup created');
         }
 
-        async function uploadFiles(files) {
-            if (!files || !files.length) return;
-            for (const file of files) {
-                try {
-                    const form = new FormData();
-                    form.append('file', file);
-                    const response = await fetch(`${API_BASE}/api/upload`, {
-                        method: 'POST',
-                        headers: authHeaders(),
-                        body: form
-                    });
-                    const data = await readJson(response);
-                    if (!response.ok) toast(data.error || 'Upload failed', true);
-                    else {
-                        const chars = data.document && Number(data.document.text_chars || 0);
-                        toast(chars ? `Uploaded ${file.name} (${chars} text chars)` : `Uploaded ${file.name}, but no readable text found`, !chars);
-                    }
-                } catch (err) {
-                    toast(`Upload connection failed. Open ${API_BASE || window.location.origin}`, true);
-                }
+        function ensureSession() {
+            if (!sessId) sessId = 's' + Date.now();
+            return sessId;
+        }
+
+        function fileKind(file) {
+            const type = (file.type || '').split('/')[0];
+            const ext = (file.name.split('.').pop() || '').toLowerCase();
+            if (type === 'image') return 'image';
+            if (type === 'audio') return 'audio';
+            if (type === 'video') return 'video';
+            if (['pdf', 'doc', 'docx', 'xls', 'xlsx', 'csv', 'ppt', 'pptx', 'txt'].includes(ext)) return 'document';
+            return 'file';
+        }
+
+        function formatBytes(bytes) {
+            if (!bytes) return '0 B';
+            const units = ['B', 'KB', 'MB', 'GB'];
+            let size = bytes;
+            let unit = 0;
+            while (size >= 1024 && unit < units.length - 1) {
+                size /= 1024;
+                unit++;
             }
+            return `${size.toFixed(size >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
+        }
+
+        function attachmentIcon(att) {
+            if (att.preview && att.media_kind === 'image') return `<img src="${att.preview}" alt="">`;
+            const map = { image: 'IMG', audio: 'AUD', video: 'VID', document: 'DOC', file: 'FILE' };
+            return map[att.media_kind] || 'FILE';
+        }
+
+        function renderAttachmentTray() {
+            const tray = document.getElementById('attachmentTray');
+            if (!tray) return;
+            tray.innerHTML = draftAttachments.map(att => `
+                <div class="att-card" data-id="${att.localId}">
+                    <div class="att-ico">${attachmentIcon(att)}</div>
+                    <div class="att-meta">
+                        <div class="att-name">${esc(att.filename || att.name)}</div>
+                        <div class="att-sub">${esc(att.media_kind || 'file')} · ${formatBytes(att.size_bytes || att.size || 0)} · ${att.status}</div>
+                    </div>
+                    <button class="att-x" type="button" onclick="removeDraftAttachment('${att.localId}')">×</button>
+                    <div class="att-progress"><span style="width:${att.progress || 0}%"></span></div>
+                </div>
+            `).join('');
+        }
+
+        function removeDraftAttachment(localId) {
+            const att = draftAttachments.find(item => item.localId === localId);
+            if (att && att.xhr && att.status === 'uploading') att.xhr.abort();
+            draftAttachments = draftAttachments.filter(item => item.localId !== localId);
+            renderAttachmentTray();
+        }
+
+        function uploadOneFile(file) {
+            ensureSession();
+            const localId = 'a' + Date.now() + Math.random().toString(16).slice(2);
+            const att = {
+                localId,
+                name: file.name,
+                filename: file.name,
+                media_kind: fileKind(file),
+                size: file.size,
+                size_bytes: file.size,
+                status: 'uploading',
+                progress: 1,
+                preview: file.type.startsWith('image/') ? URL.createObjectURL(file) : ''
+            };
+            draftAttachments.push(att);
+            renderAttachmentTray();
+
+            return new Promise(resolve => {
+                const form = new FormData();
+                form.append('files', file);
+                form.append('chat_id', sessId);
+                const xhr = new XMLHttpRequest();
+                att.xhr = xhr;
+                xhr.open('POST', `${API_BASE}/api/upload`);
+                Object.entries(authHeaders()).forEach(([key, value]) => xhr.setRequestHeader(key, value));
+                xhr.upload.onprogress = event => {
+                    if (event.lengthComputable) {
+                        att.progress = Math.max(4, Math.round((event.loaded / event.total) * 100));
+                        renderAttachmentTray();
+                    }
+                };
+                xhr.onload = () => {
+                    let data = {};
+                    try { data = JSON.parse(xhr.responseText || '{}'); } catch {}
+                    if (xhr.status >= 200 && xhr.status < 300 && data.document) {
+                        Object.assign(att, data.document, { localId, status: 'ready', progress: 100, preview: att.preview });
+                        toast(`Attached ${file.name}`);
+                    } else {
+                        att.status = 'failed';
+                        att.error = data.error || 'Upload failed';
+                        toast(att.error, true);
+                    }
+                    renderAttachmentTray();
+                    resolve(att);
+                };
+                xhr.onerror = () => {
+                    att.status = 'failed';
+                    att.error = 'Upload connection failed';
+                    renderAttachmentTray();
+                    toast(`Upload connection failed. Open ${API_BASE || window.location.origin}`, true);
+                    resolve(att);
+                };
+                xhr.onabort = () => resolve(att);
+                xhr.send(form);
+            });
+        }
+
+        async function uploadFiles(files) {
+            const list = Array.from(files || []);
+            if (!list.length) return;
+            await Promise.all(list.map(uploadOneFile));
+            const pick = document.getElementById('filePick');
+            if (pick) pick.value = '';
         }
 
         async function exportCurrentChat() {
@@ -2274,28 +2585,87 @@ RULES:
         function speakText(text) {
             if (!window.speechSynthesis) return toast('Voice output is not supported here', true);
             speechSynthesis.cancel();
-            speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+            activeUtterance = new SpeechSynthesisUtterance(text.replace(/\*\*Sources\*\*[\s\S]*$/i, '').trim());
+            activeUtterance.lang = 'en-US';
+            speechSynthesis.speak(activeUtterance);
         }
 
-        function startVoiceInput() {
+        function pauseSpeech() {
+            if (window.speechSynthesis) speechSynthesis.pause();
+        }
+
+        function resumeSpeech() {
+            if (window.speechSynthesis) speechSynthesis.resume();
+        }
+
+        function stopSpeech() {
+            if (window.speechSynthesis) speechSynthesis.cancel();
+        }
+
+        function setRecPanel(show, text) {
+            const panel = document.getElementById('recPanel');
+            const status = document.getElementById('recStatus');
+            const micBtn = document.getElementById('micBtn');
+            if (panel) panel.classList.toggle('show', !!show);
+            if (status) status.textContent = text || (speechLang === 'ur-PK' ? 'Listening in Urdu' : 'Listening in English');
+            if (micBtn) micBtn.classList.toggle('on', !!show);
+        }
+
+        function stopSpeechStream() {
+            if (speechStream) speechStream.getTracks().forEach(track => track.stop());
+            speechStream = null;
+        }
+
+        function resetSilenceTimer() {
+            clearTimeout(silenceTimer);
+            silenceTimer = setTimeout(() => {
+                if (speechRec && !speechPaused) {
+                    setRecPanel(true, 'Stopped after silence');
+                    try { speechRec.stop(); } catch {}
+                }
+            }, 6500);
+        }
+
+        async function startVoiceInput() {
             if (!window.isSecureContext) {
                 return toast('Mic needs localhost or HTTPS. Open http://127.0.0.1:5000', true);
             }
             const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
             if (!SpeechRecognition) return toast('Voice input is supported in Chrome/Edge. Please use one of those browsers.', true);
-            const micBtn = document.getElementById('micBtn');
+            cancelVoiceInput(false);
+            try {
+                speechStream = await navigator.mediaDevices.getUserMedia({
+                    audio: { noiseSuppression: true, echoCancellation: true, autoGainControl: true }
+                });
+            } catch (err) {
+                return toast('Microphone permission is blocked. Allow mic access in browser settings.', true);
+            }
             const rec = new SpeechRecognition();
-            rec.lang = navigator.language || 'en-US';
-            rec.interimResults = false;
+            speechRec = rec;
+            speechPaused = false;
+            speechPauseRequested = false;
+            rec.lang = speechLang;
+            rec.interimResults = true;
+            rec.continuous = true;
             rec.maxAlternatives = 1;
             rec.onstart = () => {
-                if (micBtn) micBtn.classList.add('on');
-                toast('Listening...');
+                setRecPanel(true);
+                resetSilenceTimer();
             };
             rec.onresult = e => {
-                document.getElementById('ta').value = e.results[0][0].transcript;
-                resize(document.getElementById('ta'));
-                toast('Voice added');
+                resetSilenceTimer();
+                let finalText = '';
+                let interimText = '';
+                for (let i = e.resultIndex; i < e.results.length; i++) {
+                    const chunk = e.results[i][0].transcript;
+                    if (e.results[i].isFinal) finalText += chunk + ' ';
+                    else interimText += chunk;
+                }
+                const ta = document.getElementById('ta');
+                const base = ta.dataset.finalTranscript || ta.value || '';
+                if (finalText) ta.dataset.finalTranscript = `${base} ${finalText}`.trim();
+                ta.value = `${ta.dataset.finalTranscript || base}${interimText ? ' ' + interimText : ''}`.trim();
+                resize(ta);
             };
             rec.onerror = e => {
                 const reason = e.error === 'not-allowed'
@@ -2304,42 +2674,72 @@ RULES:
                 toast(reason, true);
             };
             rec.onend = () => {
-                if (micBtn) micBtn.classList.remove('on');
+                clearTimeout(silenceTimer);
+                stopSpeechStream();
+                speechRec = null;
+                if (speechPauseRequested) {
+                    speechPaused = true;
+                    setRecPanel(true, 'Paused');
+                } else {
+                    speechPaused = false;
+                    setRecPanel(false);
+                }
+                const ta = document.getElementById('ta');
+                if (ta) delete ta.dataset.finalTranscript;
             };
             try {
                 rec.start();
             } catch (err) {
-                if (micBtn) micBtn.classList.remove('on');
+                stopSpeechStream();
+                setRecPanel(false);
                 toast('Mic could not start. Please try again.', true);
             }
         }
 
-        function installFeatureControls() {
-            const row = document.querySelector('.irow');
-            if (row && !document.getElementById('filePick')) {
-                const file = document.createElement('input');
-                file.type = 'file';
-                file.id = 'filePick';
-                file.multiple = true;
-                file.accept = '.pdf,.docx,.pptx,.txt,image/*';
-                file.style.display = 'none';
-                file.onchange = e => uploadFiles(e.target.files);
-                row.insertBefore(file, document.getElementById('ta'));
-                const upload = document.createElement('button');
-                upload.id = 'uploadBtn';
-                upload.className = 'act';
-                upload.textContent = '+';
-                upload.onclick = () => file.click();
-                row.insertBefore(upload, document.getElementById('ta'));
-                const mic = document.createElement('button');
-                mic.id = 'micBtn';
-                mic.className = 'act';
-                mic.type = 'button';
-                mic.title = 'Voice input';
-                mic.textContent = 'Mic';
-                mic.onclick = startVoiceInput;
-                row.insertBefore(mic, document.getElementById('ta'));
+        function pauseVoiceInput() {
+            if (!speechRec) return;
+            speechPaused = true;
+            speechPauseRequested = true;
+            clearTimeout(silenceTimer);
+            try { speechRec.stop(); } catch {}
+            setRecPanel(true, 'Paused');
+        }
+
+        function resumeVoiceInput() {
+            if (speechRec || !speechPaused) return;
+            speechPauseRequested = false;
+            startVoiceInput();
+        }
+
+        function cancelVoiceInput(showToast = true) {
+            clearTimeout(silenceTimer);
+            if (speechRec) {
+                try { speechRec.abort(); } catch {}
             }
+            speechRec = null;
+            speechPaused = false;
+            speechPauseRequested = false;
+            stopSpeechStream();
+            setRecPanel(false);
+            if (showToast) toast('Recording cancelled');
+        }
+
+        function toggleSpeechLang() {
+            speechLang = speechLang === 'ur-PK' ? 'en-US' : 'ur-PK';
+            localStorage.setItem('caspam_speech_lang', speechLang);
+            const wasActive = !!speechRec;
+            cancelVoiceInput(false);
+            if (wasActive) startVoiceInput();
+            toast(speechLang === 'ur-PK' ? 'Urdu transcription' : 'English transcription');
+        }
+
+        function installFeatureControls() {
+            const file = document.getElementById('filePick');
+            if (file && !file.dataset.ready) {
+                file.dataset.ready = '1';
+                file.onchange = e => uploadFiles(e.target.files);
+            }
+            installDragDrop();
             const toolbar = document.getElementById('tb');
             if (toolbar && !document.getElementById('featureTools')) {
                 const tools = document.createElement('div');
@@ -2353,6 +2753,21 @@ RULES:
           <button class="tb-btn" onclick="exportCurrentChat()">Export</button>`;
                 toolbar.appendChild(tools);
             }
+        }
+
+        function installDragDrop() {
+            if (document.body.dataset.dropReady) return;
+            document.body.dataset.dropReady = '1';
+            const zone = document.getElementById('dropZone');
+            ['dragenter', 'dragover'].forEach(name => document.addEventListener(name, e => {
+                e.preventDefault();
+                if (zone) zone.classList.add('show');
+            }));
+            ['dragleave', 'drop'].forEach(name => document.addEventListener(name, e => {
+                e.preventDefault();
+                if (name === 'drop' && e.dataTransfer && e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files);
+                if (zone) zone.classList.remove('show');
+            }));
         }
         // Add web search function to frontend
         async function searchWeb(query) {
@@ -2371,19 +2786,26 @@ RULES:
         async function send() {
             const ta = document.getElementById('ta');
             const text = ta.value.trim();
-            if (!text) return;
-            if (!sessId) sessId = 's' + Date.now();
+            const readyAttachments = draftAttachments.filter(att => att.status === 'ready');
+            const uploading = draftAttachments.some(att => att.status === 'uploading');
+            if (uploading) return toast('Please wait for uploads to finish.', true);
+            if (!text && !readyAttachments.length) return;
+            ensureSession();
             const first = msgs.length === 0;
+            const messageText = text || 'Please review the attached files.';
             hideW();
-            addMsg('user', text);
+            addMsg('user', messageText, false, readyAttachments);
             ta.value = '';
             ta.style.height = 'auto';
+            draftAttachments = draftAttachments.filter(att => att.status !== 'ready');
+            renderAttachmentTray();
             closeSB();
             msgs.push({
                 role: 'user',
-                content: text
+                content: messageText,
+                attachments: readyAttachments.map(({ xhr, preview, ...att }) => att)
             });
-            if (first) saveSess(text.slice(0, 40) + (text.length > 40 ? '…' : ''));
+            if (first) saveSess(messageText.slice(0, 40) + (messageText.length > 40 ? '…' : ''));
             showT(true);
             document.getElementById('sBtn').disabled = true;
             try {
@@ -2403,7 +2825,21 @@ RULES:
         }
 
         // ── RENDER ────────────────────────────────
-        function addMsg(role, text, silent = false) {
+        function renderAttachmentCards(attachments, removable = false) {
+            if (!attachments || !attachments.length) return '';
+            return `<div class="msg-files">${attachments.map(att => `
+                <div class="att-card">
+                    <div class="att-ico">${attachmentIcon(att)}</div>
+                    <div class="att-meta">
+                        <div class="att-name">${esc(att.filename || att.name || 'Attachment')}</div>
+                        <div class="att-sub">${esc(att.media_kind || 'file')} · ${formatBytes(att.size_bytes || att.size || 0)}${att.text_chars ? ' · ' + att.text_chars + ' chars' : ''}</div>
+                    </div>
+                    ${removable ? `<button class="att-x" type="button">×</button>` : '<span></span>'}
+                </div>
+            `).join('')}</div>`;
+        }
+
+        function addMsg(role, text, silent = false, attachments = []) {
             const chat = document.getElementById('chat');
             const typing = document.getElementById('typing');
             const wrap = document.createElement('div');
@@ -2420,6 +2856,11 @@ RULES:
                 if (window.hljs) bub.querySelectorAll('pre code').forEach(b => hljs.highlightElement(b));
             } else bub.textContent = text;
             col.appendChild(bub);
+            if (attachments && attachments.length) {
+                const files = document.createElement('div');
+                files.innerHTML = renderAttachmentCards(attachments);
+                col.appendChild(files.firstElementChild);
+            }
             if (role === 'bot') {
                 const acts = document.createElement('div');
                 acts.className = 'm-acts';
@@ -2436,6 +2877,21 @@ RULES:
                 sp.textContent = 'Speak';
                 sp.onclick = () => speakText(text);
                 acts.appendChild(sp);
+                const pause = document.createElement('button');
+                pause.className = 'act';
+                pause.textContent = 'Pause';
+                pause.onclick = pauseSpeech;
+                acts.appendChild(pause);
+                const resume = document.createElement('button');
+                resume.className = 'act';
+                resume.textContent = 'Resume';
+                resume.onclick = resumeSpeech;
+                acts.appendChild(resume);
+                const stop = document.createElement('button');
+                stop.className = 'act';
+                stop.textContent = 'Stop';
+                stop.onclick = stopSpeech;
+                acts.appendChild(stop);
                 col.appendChild(acts);
             }
             wrap.appendChild(av);
@@ -2498,6 +2954,9 @@ RULES:
             msgs = [];
             sessId = null;
             currentContext = null;
+            draftAttachments = [];
+            renderAttachmentTray();
+            cancelVoiceInput(false);
             wipeUI();
             document.getElementById('welcome').style.display = 'flex';
             toast('New chat ✓');
