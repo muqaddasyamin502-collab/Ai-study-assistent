@@ -5,8 +5,32 @@ from urllib.parse import quote_plus, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 from flask_cors import CORS
+
+from services import (
+    LATEST_PROMPT_VERSION,
+    activity,
+    analytics,
+    backup_data,
+    create_or_update_chat,
+    dashboard,
+    db,
+    export_chat,
+    get_profile,
+    get_user_id,
+    get_user_role,
+    init_db,
+    list_documents,
+    log_activity,
+    rag_context,
+    restore_data,
+    save_document,
+    save_lecture_version,
+    set_chat_flag,
+    suggested_questions,
+    upsert_profile,
+)
 
 load_dotenv()
 
@@ -14,13 +38,21 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 app = Flask(__name__, static_folder=BASE_DIR, static_url_path="")
 CORS(app)
+init_db()
 
 
 @app.after_request
 def add_cors_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = (
+        request.headers.get("Access-Control-Request-Headers")
+        or "Content-Type, Authorization, X-User-Id, X-Firebase-Uid, X-User-Email, X-User-Role"
+    )
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PATCH"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(self), geolocation=(), payment=()"
     return response
 
 def clean_env_value(value):
@@ -210,14 +242,14 @@ def context_message(website_context):
     )
 
 
-def call_groq(messages, context_prompt):
+def call_groq(messages, context_prompt, system_prompt=None):
     if not GROQ_API_KEY:
         raise RuntimeError("Groq API key is missing.")
 
     payload = {
         "model": GROQ_MODEL,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt or SYSTEM_PROMPT},
             {"role": "system", "content": context_prompt},
             *messages,
         ],
@@ -244,7 +276,7 @@ def call_groq(messages, context_prompt):
     return result["choices"][0]["message"]["content"]
 
 
-def call_gemini(messages, context_prompt):
+def call_gemini(messages, context_prompt, system_prompt=None):
     if not GEMINI_API_KEY:
         raise RuntimeError("Gemini API key is missing.")
 
@@ -259,7 +291,7 @@ def call_gemini(messages, context_prompt):
 
     payload = {
         "systemInstruction": {
-            "parts": [{"text": f"{SYSTEM_PROMPT}\n\n{context_prompt}"}]
+            "parts": [{"text": f"{system_prompt or SYSTEM_PROMPT}\n\n{context_prompt}"}]
         },
         "contents": contents,
         "generationConfig": {
@@ -286,13 +318,13 @@ def call_gemini(messages, context_prompt):
     return result["candidates"][0]["content"]["parts"][0]["text"]
 
 
-def call_claude(messages, context_prompt):
+def call_claude(messages, context_prompt, system_prompt=None):
     if not CLAUDE_API_KEY:
         raise RuntimeError("Claude API key is missing.")
 
     payload = {
         "model": CLAUDE_MODEL,
-        "system": f"{SYSTEM_PROMPT}\n\n{context_prompt}",
+        "system": f"{system_prompt or SYSTEM_PROMPT}\n\n{context_prompt}",
         "messages": messages,
         "temperature": 0.4,
         "max_tokens": MAX_OUTPUT_TOKENS,
@@ -317,7 +349,7 @@ def call_claude(messages, context_prompt):
     return "".join(block.get("text", "") for block in result.get("content", []))
 
 
-def generate_reply(messages, context_prompt):
+def generate_reply(messages, context_prompt, system_prompt=None):
     providers = [
         ("Groq", call_groq),
         ("Gemini", call_gemini),
@@ -326,7 +358,7 @@ def generate_reply(messages, context_prompt):
     errors = []
     for provider, caller in providers:
         try:
-            reply = caller(messages, context_prompt)
+            reply = caller(messages, context_prompt, system_prompt)
             return provider, reply
         except Exception as exc:
             errors.append(f"{provider}: {exc}")
@@ -350,6 +382,7 @@ def health():
                 "claude": {"model": CLAUDE_MODEL, "has_api_key": bool(CLAUDE_API_KEY)},
             },
             "sources": KNOWLEDGE_SOURCES,
+            "prompt_version": LATEST_PROMPT_VERSION,
         }
     )
 
@@ -370,6 +403,9 @@ def chat():
 
     data = request.get_json(silent=True) or {}
     messages = normalize_messages(data.get("messages", []))
+    chat_id = clean_text(data.get("chat_id", ""))[:128]
+    title = clean_text(data.get("title", ""))[:160]
+    user_id = get_user_id(request)
 
     if not messages:
         return jsonify({"error": "No messages received."}), 400
@@ -378,11 +414,50 @@ def chat():
     if not re.search(r"[A-Za-z0-9\u0600-\u06FF]", latest_user_message):
         return jsonify({"reply": "Please type a clear question so I can help you."})
 
-    context_prompt = context_message(build_website_context(latest_user_message))
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    chat_system_prompt = SYSTEM_PROMPT
+    if metadata.get("legacy_chat") and clean_text(metadata.get("system_prompt", "")):
+        chat_system_prompt = metadata["system_prompt"]
+    frozen = None
+    if chat_id:
+        frozen = create_or_update_chat(
+            user_id,
+            chat_id,
+            title or latest_user_message[:40],
+            messages,
+            chat_system_prompt,
+            LATEST_PROMPT_VERSION,
+            metadata,
+        )
+
+    website_context = build_website_context(latest_user_message)
+    document_context, sources = rag_context(user_id, latest_user_message)
+    combined_context = "\n\n---\n\n".join(part for part in [website_context, document_context] if part)
+    context_prompt = context_message(combined_context)
 
     try:
-        provider, reply = generate_reply(messages, context_prompt)
-        return jsonify({"provider": provider, "reply": reply})
+        provider, reply = generate_reply(messages, context_prompt, (frozen or {}).get("system_prompt") or SYSTEM_PROMPT)
+        updated_messages = [*messages, {"role": "assistant", "content": reply, "sources": sources}]
+        if chat_id:
+            create_or_update_chat(
+                user_id,
+                chat_id,
+                title or latest_user_message[:40],
+                updated_messages,
+                chat_system_prompt,
+                LATEST_PROMPT_VERSION,
+                metadata,
+            )
+        log_activity(user_id, "chat.message", {"chat_id": chat_id, "provider": provider})
+        return jsonify(
+            {
+                "provider": provider,
+                "reply": reply,
+                "sources": sources,
+                "suggested": suggested_questions(updated_messages, sources),
+                "prompt_version": (frozen or {}).get("prompt_version") or LATEST_PROMPT_VERSION,
+            }
+        )
 
     except requests.Timeout:
         return jsonify({"error": "AI request timed out. Please try again."}), 504
@@ -405,6 +480,116 @@ def search():
         results = [{"title": name, "url": url} for name, url in KNOWLEDGE_SOURCES.items()]
 
     return jsonify({"query": query, "results": results[:8]})
+
+
+@app.post("/api/profile")
+def profile_save():
+    user_id = get_user_id(request)
+    data = request.get_json(silent=True) or {}
+    upsert_profile(
+        user_id,
+        clean_text(data.get("email", "")),
+        clean_text(data.get("display_name", "")),
+        clean_text(data.get("role", "student")),
+        data.get("preferences") if isinstance(data.get("preferences"), dict) else {},
+    )
+    return jsonify({"profile": get_profile(user_id)})
+
+
+@app.get("/api/profile")
+def profile_get():
+    return jsonify({"profile": get_profile(get_user_id(request))})
+
+
+@app.post("/api/upload")
+def upload():
+    user_id = get_user_id(request)
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded."}), 400
+    try:
+        doc = save_document(user_id, request.files["file"])
+        return jsonify({"document": doc, "documents": list_documents(user_id)})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.get("/api/documents")
+def documents():
+    return jsonify({"documents": list_documents(get_user_id(request))})
+
+
+@app.get("/api/dashboard")
+def dashboard_route():
+    user_id = get_user_id(request)
+    return jsonify(dashboard(user_id, get_user_role(request)))
+
+
+@app.get("/api/analytics")
+def analytics_route():
+    user_id = get_user_id(request)
+    return jsonify(analytics(user_id, get_user_role(request)))
+
+
+@app.get("/api/activity")
+def activity_route():
+    user_id = get_user_id(request)
+    return jsonify({"activity": activity(user_id, get_user_role(request))})
+
+
+@app.patch("/api/chats/<chat_id>/flags")
+def chat_flags(chat_id):
+    user_id = get_user_id(request)
+    data = request.get_json(silent=True) or {}
+    for flag in ("pinned", "bookmarked"):
+        if flag in data:
+            set_chat_flag(user_id, chat_id, flag, bool(data[flag]))
+    return jsonify({"ok": True})
+
+
+@app.get("/api/chats/<chat_id>/export")
+def chat_export(chat_id):
+    fmt = request.args.get("format", "md").lower()
+    try:
+        mimetype, content = export_chat(get_user_id(request), chat_id, fmt)
+        extension = "json" if fmt == "json" else "md"
+        return Response(
+            content,
+            mimetype=mimetype,
+            headers={"Content-Disposition": f"attachment; filename=caspam-chat-{chat_id}.{extension}"},
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 404
+
+
+@app.post("/api/lectures/<lecture_id>/versions")
+def lecture_version(lecture_id):
+    user_id = get_user_id(request)
+    data = request.get_json(silent=True) or {}
+    return jsonify(
+        save_lecture_version(
+            user_id,
+            lecture_id,
+            clean_text(data.get("title", "")),
+            data.get("content", ""),
+        )
+    )
+
+
+@app.post("/api/backup")
+def backup_route():
+    try:
+        return jsonify(backup_data(get_user_id(request), get_user_role(request)))
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+
+
+@app.post("/api/restore")
+def restore_route():
+    try:
+        restore_data(get_user_id(request), get_user_role(request), request.get_json(silent=True) or {})
+        return jsonify({"ok": True})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
 
 
 @app.get("/api/bzu/")
