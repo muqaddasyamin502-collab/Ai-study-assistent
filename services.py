@@ -292,7 +292,7 @@ def score_text(query, text):
 def best_document_chunks(user_id, query, limit=5):
     with db() as conn:
         rows = conn.execute(
-            "select id, filename, text from documents where owner_id in (?, 'shared') and coalesce(text,'') != ''",
+            "select id, filename, text, created_at from documents where owner_id in (?, 'shared') and coalesce(text,'') != '' order by created_at desc",
             (user_id,),
         ).fetchall()
     scored = []
@@ -304,7 +304,33 @@ def best_document_chunks(user_id, query, limit=5):
             if score:
                 scored.append((score, {"document_id": row["id"], "title": row["filename"], "chunk": idx + 1, "content": part[:1200]}))
     scored.sort(key=lambda item: item[0], reverse=True)
-    return [item[1] for item in scored[:limit]]
+    if scored:
+        return [item[1] for item in scored[:limit]]
+
+    q = query.lower()
+    wants_uploaded_notes = any(
+        phrase in q
+        for phrase in [
+            "uploaded",
+            "lecture note",
+            "lecture notes",
+            "my notes",
+            "notes",
+            "document",
+            "pdf",
+            "summarize",
+            "summary",
+        ]
+    )
+    if not wants_uploaded_notes:
+        return []
+
+    fallback = []
+    for row in rows[:limit]:
+        text = row["text"] or ""
+        if text:
+            fallback.append({"document_id": row["id"], "title": row["filename"], "chunk": 1, "content": text[:1200]})
+    return fallback
 
 
 def rag_context(user_id, query):
