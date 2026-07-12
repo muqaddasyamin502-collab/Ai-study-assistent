@@ -32,6 +32,9 @@ AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".ogg", ".webm"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 DOCUMENT_EXTENSIONS = ALLOWED_EXTENSIONS - IMAGE_EXTENSIONS - AUDIO_EXTENSIONS - VIDEO_EXTENSIONS
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
+CHUNK_CHARS = int(os.getenv("DOCUMENT_CHUNK_CHARS", "1400"))
+CHUNK_OVERLAP = int(os.getenv("DOCUMENT_CHUNK_OVERLAP", "220"))
+MAX_RAG_CHUNKS = int(os.getenv("MAX_RAG_CHUNKS", "10"))
 LATEST_PROMPT_VERSION = os.getenv("SYSTEM_PROMPT_VERSION", "2026-07-10")
 GROQ_AUDIO_TRANSCRIPTION_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_TRANSCRIPTION_MODEL = os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo")
@@ -84,6 +87,25 @@ def init_db():
                 summary text,
                 created_at text not null
             );
+            create table if not exists document_chunks (
+                id text primary key,
+                document_id text not null,
+                owner_id text,
+                chat_id text,
+                filename text,
+                chunk_index integer not null,
+                locator_type text,
+                locator_label text,
+                page_number integer,
+                text text not null,
+                embedding text,
+                token_count integer default 0,
+                created_at text not null
+            );
+            create index if not exists idx_document_chunks_owner_chat
+                on document_chunks(owner_id, chat_id, document_id);
+            create index if not exists idx_document_chunks_document
+                on document_chunks(document_id, chunk_index);
             create table if not exists chats (
                 id text primary key,
                 owner_id text,
@@ -222,6 +244,18 @@ def extract_txt(raw):
     return raw.decode("utf-8", errors="ignore")
 
 
+def make_segment(text, locator_type="document", locator_label="Document", page_number=None):
+    text = clean_text(text)
+    if not text:
+        return None
+    return {
+        "text": text,
+        "locator_type": locator_type,
+        "locator_label": locator_label,
+        "page_number": page_number,
+    }
+
+
 def extract_docx(raw):
     text = []
     with zipfile.ZipFile(io.BytesIO(raw)) as zf:
@@ -233,6 +267,10 @@ def extract_docx(raw):
     return " ".join(text)
 
 
+def extract_docx_segments(raw):
+    return [seg for seg in [make_segment(extract_docx(raw), "document", "Document")] if seg]
+
+
 def extract_pptx(raw):
     text = []
     with zipfile.ZipFile(io.BytesIO(raw)) as zf:
@@ -242,6 +280,22 @@ def extract_pptx(raw):
                 if node.tag.endswith("}t") and node.text:
                     text.append(node.text)
     return " ".join(text)
+
+
+def extract_pptx_segments(raw):
+    segments = []
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        slide_names = sorted(n for n in zf.namelist() if n.startswith("ppt/slides/slide") and n.endswith(".xml"))
+        for index, name in enumerate(slide_names, start=1):
+            text = []
+            root = ElementTree.fromstring(zf.read(name))
+            for node in root.iter():
+                if node.tag.endswith("}t") and node.text:
+                    text.append(node.text)
+            seg = make_segment(" ".join(text), "slide", f"Slide {index}", index)
+            if seg:
+                segments.append(seg)
+    return segments
 
 
 def extract_xlsx(raw):
@@ -270,10 +324,45 @@ def extract_xlsx(raw):
     return " ".join(values)
 
 
+def extract_xlsx_segments(raw):
+    segments = []
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        shared = []
+        if "xl/sharedStrings.xml" in zf.namelist():
+            root = ElementTree.fromstring(zf.read("xl/sharedStrings.xml"))
+            for item in root.iter():
+                if item.tag.endswith("}t") and item.text:
+                    shared.append(item.text)
+        sheet_names = sorted(n for n in zf.namelist() if n.startswith("xl/worksheets/") and n.endswith(".xml"))
+        for index, name in enumerate(sheet_names, start=1):
+            values = []
+            root = ElementTree.fromstring(zf.read(name))
+            for cell in root.iter():
+                if not cell.tag.endswith("}c"):
+                    continue
+                cell_type = cell.attrib.get("t")
+                raw_value = next((child.text for child in cell if child.tag.endswith("}v") and child.text), "")
+                inline_value = " ".join(child.text for child in cell.iter() if child.tag.endswith("}t") and child.text)
+                if cell_type == "s" and raw_value.isdigit() and int(raw_value) < len(shared):
+                    values.append(shared[int(raw_value)])
+                elif inline_value:
+                    values.append(inline_value)
+                elif raw_value:
+                    values.append(raw_value)
+            seg = make_segment(" ".join(values), "sheet", f"Sheet {index}", index)
+            if seg:
+                segments.append(seg)
+    return segments
+
+
 def extract_csv(raw):
     text = extract_txt(raw)
     rows = csv.reader(io.StringIO(text))
     return " ".join(" ".join(cell for cell in row if cell) for row in rows)
+
+
+def extract_csv_segments(raw):
+    return [seg for seg in [make_segment(extract_csv(raw), "sheet", "CSV")] if seg]
 
 
 def extract_pdf(raw):
@@ -285,6 +374,20 @@ def extract_pdf(raw):
     return "\n".join(page.extract_text() or "" for page in reader.pages)
 
 
+def extract_pdf_segments(raw):
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        return []
+    segments = []
+    reader = PdfReader(io.BytesIO(raw))
+    for index, page in enumerate(reader.pages, start=1):
+        seg = make_segment(page.extract_text() or "", "page", f"Page {index}", index)
+        if seg:
+            segments.append(seg)
+    return segments
+
+
 def extract_image(raw):
     try:
         import pytesseract
@@ -293,6 +396,10 @@ def extract_image(raw):
         return ""
     image = Image.open(io.BytesIO(raw))
     return pytesseract.image_to_string(image)
+
+
+def extract_image_segments(raw):
+    return [seg for seg in [make_segment(extract_image(raw), "image", "Image OCR")] if seg]
 
 
 def extract_text_from_upload(filename, raw):
@@ -315,6 +422,73 @@ def extract_text_from_upload(filename, raw):
     except Exception:
         return ""
     return ""
+
+
+def extract_segments_from_upload(filename, raw):
+    ext = Path(filename).suffix.lower()
+    try:
+        if ext == ".txt":
+            return [seg for seg in [make_segment(extract_txt(raw), "document", "Text file")] if seg]
+        if ext == ".docx":
+            return extract_docx_segments(raw)
+        if ext == ".pptx":
+            return extract_pptx_segments(raw)
+        if ext == ".xlsx":
+            return extract_xlsx_segments(raw)
+        if ext == ".csv":
+            return extract_csv_segments(raw)
+        if ext == ".pdf":
+            return extract_pdf_segments(raw)
+        if ext in IMAGE_EXTENSIONS:
+            return extract_image_segments(raw)
+    except Exception:
+        return []
+    text = extract_text_from_upload(filename, raw)
+    return [seg for seg in [make_segment(text)] if seg]
+
+
+def sparse_embedding(text, limit=160):
+    words = Counter(tokenize(text))
+    if not words:
+        return {}
+    total = sum(words.values()) or 1
+    return {word: round(count / total, 6) for word, count in words.most_common(limit)}
+
+
+def sparse_similarity(query_embedding, chunk_embedding):
+    if not query_embedding or not chunk_embedding:
+        return 0.0
+    dot = sum(weight * chunk_embedding.get(word, 0) for word, weight in query_embedding.items())
+    q_norm = sum(weight * weight for weight in query_embedding.values()) ** 0.5
+    c_norm = sum(weight * weight for weight in chunk_embedding.values()) ** 0.5
+    if not q_norm or not c_norm:
+        return 0.0
+    return dot / (q_norm * c_norm)
+
+
+def chunk_segments(segments, max_chars=CHUNK_CHARS, overlap=CHUNK_OVERLAP):
+    chunks = []
+    for segment in segments:
+        text = segment.get("text", "")
+        if not text:
+            continue
+        start = 0
+        while start < len(text):
+            end = min(len(text), start + max_chars)
+            chunk_text = text[start:end].strip()
+            if chunk_text:
+                chunks.append({
+                    "text": chunk_text,
+                    "locator_type": segment.get("locator_type") or "document",
+                    "locator_label": segment.get("locator_label") or "Document",
+                    "page_number": segment.get("page_number"),
+                    "token_count": len(tokenize(chunk_text)),
+                    "embedding": sparse_embedding(chunk_text),
+                })
+            if end >= len(text):
+                break
+            start = max(0, end - overlap)
+    return chunks
 
 
 def transcribe_media_upload(filename, raw, content_type):
@@ -370,18 +544,47 @@ def save_document(user_id, file_storage, chat_id=""):
     target = UPLOAD_DIR / f"{doc_id}_{filename}"
     target.write_bytes(raw)
     kind = media_kind(filename)
-    text = extract_text_from_upload(filename, raw)
+    segments = extract_segments_from_upload(filename, raw)
+    text = clean_text("\n\n".join(segment["text"] for segment in segments))
     if not text and kind in {"audio", "video"}:
         text = transcribe_media_upload(filename, raw, file_storage.mimetype)
+        segments = [seg for seg in [make_segment(text, kind, f"{kind.title()} transcript")] if seg]
+    chunks = chunk_segments(segments)
     summary = describe_upload(filename, file_storage.mimetype, len(raw), text)
+    now = utc_now()
     with db() as conn:
         conn.execute(
             """
             insert into documents (id, owner_id, chat_id, filename, content_type, path, text, media_kind, size_bytes, summary, created_at)
             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (doc_id, user_id, clean_text(chat_id)[:128], filename, file_storage.mimetype, str(target), text, kind, len(raw), summary, utc_now()),
+            (doc_id, user_id, clean_text(chat_id)[:128], filename, file_storage.mimetype, str(target), text, kind, len(raw), summary, now),
         )
+        for index, chunk in enumerate(chunks, start=1):
+            conn.execute(
+                """
+                insert into document_chunks (
+                    id, document_id, owner_id, chat_id, filename, chunk_index,
+                    locator_type, locator_label, page_number, text, embedding, token_count, created_at
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    uuid.uuid4().hex,
+                    doc_id,
+                    user_id,
+                    clean_text(chat_id)[:128],
+                    filename,
+                    index,
+                    chunk["locator_type"],
+                    chunk["locator_label"],
+                    chunk["page_number"],
+                    chunk["text"],
+                    json.dumps(chunk["embedding"], separators=(",", ":")),
+                    chunk["token_count"],
+                    now,
+                ),
+            )
     log_activity(user_id, "document.upload", {"document_id": doc_id, "filename": filename, "chat_id": chat_id})
     return {
         "id": doc_id,
@@ -392,6 +595,7 @@ def save_document(user_id, file_storage, chat_id=""):
         "summary": summary,
         "chat_id": clean_text(chat_id)[:128],
         "text_chars": len(text),
+        "chunks": len(chunks),
         "ocr_used": Path(filename).suffix.lower() in IMAGE_EXTENSIONS,
     }
 
@@ -401,22 +605,28 @@ def list_documents(user_id, chat_id=None):
         if chat_id:
             rows = conn.execute(
                 """
-                select id, chat_id, filename, content_type, media_kind, size_bytes, summary,
-                       length(coalesce(text,'')) as text_chars, created_at
-                from documents
-                where owner_id in (?, 'shared') and (chat_id = ? or owner_id = 'shared')
-                order by created_at desc
+                select d.id, d.chat_id, d.filename, d.content_type, d.media_kind, d.size_bytes, d.summary,
+                       length(coalesce(d.text,'')) as text_chars, d.created_at,
+                       count(c.id) as chunks, max(c.page_number) as pages
+                from documents d
+                left join document_chunks c on c.document_id = d.id
+                where d.owner_id in (?, 'shared') and (d.chat_id = ? or d.owner_id = 'shared')
+                group by d.id
+                order by d.created_at desc
                 """,
                 (user_id, chat_id),
             ).fetchall()
         else:
             rows = conn.execute(
                 """
-                select id, chat_id, filename, content_type, media_kind, size_bytes, summary,
-                       length(coalesce(text,'')) as text_chars, created_at
-                from documents
-                where owner_id in (?, 'shared')
-                order by created_at desc
+                select d.id, d.chat_id, d.filename, d.content_type, d.media_kind, d.size_bytes, d.summary,
+                       length(coalesce(d.text,'')) as text_chars, d.created_at,
+                       count(c.id) as chunks, max(c.page_number) as pages
+                from documents d
+                left join document_chunks c on c.document_id = d.id
+                where d.owner_id in (?, 'shared')
+                group by d.id
+                order by d.created_at desc
                 """,
                 (user_id,),
             ).fetchall()
@@ -435,22 +645,104 @@ def score_text(query, text):
     return sum(words.get(word, 0) * weight for word, weight in q.items())
 
 
-def best_document_chunks(user_id, query, chat_id=None, limit=5):
+def wants_document_answer(query):
+    q = query.lower()
+    return any(
+        phrase in q
+        for phrase in [
+            "uploaded", "attached", "this pdf", "this document", "lecture note", "lecture notes",
+            "my notes", "notes", "document", "pdf", "summarize", "summary", "chapter",
+            "definition", "find", "from the file", "from this file",
+        ]
+    )
+
+
+def load_chunk_embedding(raw):
+    try:
+        data = json.loads(raw or "{}")
+        return {str(key): float(value) for key, value in data.items()}
+    except Exception:
+        return {}
+
+
+def chunk_citation(chunk):
+    label = chunk.get("locator_label") or "Document"
+    if chunk.get("page_number") and chunk.get("locator_type") == "page":
+        return f"page {chunk['page_number']}"
+    return label
+
+
+def best_document_chunks(user_id, query, chat_id=None, limit=MAX_RAG_CHUNKS):
+    query_embedding = sparse_embedding(query)
     with db() as conn:
         if chat_id:
-            rows = conn.execute(
+            chunk_rows = conn.execute(
                 """
-                select id, filename, text, created_at from documents
-                where owner_id in (?, 'shared') and (chat_id = ? or owner_id = 'shared') and coalesce(text,'') != ''
-                order by created_at desc
+                select c.* from document_chunks c
+                where c.owner_id in (?, 'shared') and (c.chat_id = ? or c.owner_id = 'shared')
+                order by c.created_at desc, c.chunk_index asc
                 """,
                 (user_id, chat_id),
             ).fetchall()
         else:
-            rows = conn.execute(
-                "select id, filename, text, created_at from documents where owner_id in (?, 'shared') and coalesce(text,'') != '' order by created_at desc",
+            chunk_rows = conn.execute(
+                """
+                select c.* from document_chunks c
+                where c.owner_id in (?, 'shared')
+                order by c.created_at desc, c.chunk_index asc
+                """,
                 (user_id,),
             ).fetchall()
+
+        if not chunk_rows:
+            if chat_id:
+                rows = conn.execute(
+                    """
+                    select id, filename, text, created_at from documents
+                    where owner_id in (?, 'shared') and (chat_id = ? or owner_id = 'shared') and coalesce(text,'') != ''
+                    order by created_at desc
+                    """,
+                    (user_id, chat_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "select id, filename, text, created_at from documents where owner_id in (?, 'shared') and coalesce(text,'') != '' order by created_at desc",
+                    (user_id,),
+                ).fetchall()
+        else:
+            rows = []
+
+    if chunk_rows:
+        scored = []
+        for row in chunk_rows:
+            data = dict(row)
+            text = data.get("text") or ""
+            lexical = score_text(query, text)
+            semantic = sparse_similarity(query_embedding, load_chunk_embedding(data.get("embedding")))
+            score = lexical + (semantic * 4)
+            if score:
+                scored.append((score, data))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        if scored:
+            selected = [item[1] for item in scored[:limit]]
+        elif wants_document_answer(query):
+            selected = [dict(row) for row in chunk_rows[:limit]]
+        else:
+            selected = []
+        return [
+            {
+                "document_id": row["document_id"],
+                "title": row["filename"],
+                "chunk": row["chunk_index"],
+                "content": row["text"][:CHUNK_CHARS],
+                "locator_type": row["locator_type"],
+                "locator_label": row["locator_label"],
+                "page_number": row["page_number"],
+                "citation": chunk_citation(row),
+            }
+            for row in selected
+        ]
+
     scored = []
     for row in rows:
         text = row["text"] or ""
@@ -458,34 +750,19 @@ def best_document_chunks(user_id, query, chat_id=None, limit=5):
         for idx, part in enumerate(parts):
             score = score_text(query, part)
             if score:
-                scored.append((score, {"document_id": row["id"], "title": row["filename"], "chunk": idx + 1, "content": part[:1200]}))
+                scored.append((score, {"document_id": row["id"], "title": row["filename"], "chunk": idx + 1, "content": part[:1200], "citation": f"chunk {idx + 1}"}))
     scored.sort(key=lambda item: item[0], reverse=True)
     if scored:
         return [item[1] for item in scored[:limit]]
 
-    q = query.lower()
-    wants_uploaded_notes = any(
-        phrase in q
-        for phrase in [
-            "uploaded",
-            "lecture note",
-            "lecture notes",
-            "my notes",
-            "notes",
-            "document",
-            "pdf",
-            "summarize",
-            "summary",
-        ]
-    )
-    if not wants_uploaded_notes:
+    if not wants_document_answer(query):
         return []
 
     fallback = []
     for row in rows[:limit]:
         text = row["text"] or ""
         if text:
-            fallback.append({"document_id": row["id"], "title": row["filename"], "chunk": 1, "content": text[:1200]})
+            fallback.append({"document_id": row["id"], "title": row["filename"], "chunk": 1, "content": text[:1200], "citation": "chunk 1"})
     return fallback
 
 
@@ -515,10 +792,25 @@ def rag_context(user_id, query, chat_id=None):
     if not chunks:
         return file_context, file_sources
     context = "\n\n".join(
-        f"Document: {c['title']} (chunk {c['chunk']})\n{c['content']}" for c in chunks
+        f"Document: {c['title']} ({c.get('citation') or 'chunk ' + str(c['chunk'])}, chunk {c['chunk']})\n{c['content']}" for c in chunks
     )
-    sources = [{"document_id": c["document_id"], "title": c["title"], "chunk": c["chunk"]} for c in chunks]
-    full_context = "\n\n".join(part for part in [file_context, "Use these uploaded document excerpts when relevant and cite them by document title and chunk.\n\n" + context] if part)
+    sources = [
+        {
+            "document_id": c["document_id"],
+            "title": c["title"],
+            "chunk": c["chunk"],
+            "page": c.get("page_number"),
+            "citation": c.get("citation"),
+        }
+        for c in chunks
+    ]
+    doc_rule = (
+        "Use these uploaded document excerpts as the authoritative source for document questions. "
+        "When the user asks to summarize, define, find, or answer from an uploaded file, answer only from these excerpts. "
+        "If the answer is not present in the excerpts, say it is not available in the uploaded document context. "
+        "Cite the document title and page/slide/sheet/chunk shown with each excerpt.\n\n"
+    )
+    full_context = "\n\n".join(part for part in [file_context, doc_rule + context] if part)
     return full_context, [*file_sources, *sources]
 
 
@@ -656,7 +948,7 @@ def backup_data(user_id, role):
     target = BACKUP_DIR / backup_id
     payload = {}
     with db() as conn:
-        for table in ("profiles", "documents", "chats", "messages", "activity_logs", "lecture_versions"):
+        for table in ("profiles", "documents", "document_chunks", "chats", "messages", "activity_logs", "lecture_versions"):
             payload[table] = [dict(row) for row in conn.execute(f"select * from {table}").fetchall()]
     target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     log_activity(user_id, "backup.create", {"backup": backup_id})
@@ -669,6 +961,7 @@ def restore_data(user_id, role, payload):
     allowed = {
         "profiles": {"user_id", "email", "display_name", "role", "preferences", "updated_at"},
         "documents": {"id", "owner_id", "chat_id", "filename", "content_type", "path", "text", "media_kind", "size_bytes", "summary", "created_at"},
+        "document_chunks": {"id", "document_id", "owner_id", "chat_id", "filename", "chunk_index", "locator_type", "locator_label", "page_number", "text", "embedding", "token_count", "created_at"},
         "chats": {"id", "owner_id", "title", "role", "prompt_version", "system_prompt", "pinned", "bookmarked", "metadata", "created_at", "updated_at"},
         "messages": {"id", "chat_id", "role", "content", "sources", "created_at"},
         "activity_logs": {"id", "user_id", "action", "details", "created_at"},
