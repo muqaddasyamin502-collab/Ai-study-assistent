@@ -2319,7 +2319,7 @@ RULES:
 
         function withSources(text, sources) {
             if (!sources || !sources.length) return text;
-            const lines = sources.map((s, i) => `${i + 1}. ${s.title || 'Document'}${s.chunk ? ' · chunk ' + s.chunk : ''}`);
+            const lines = sources.map((s, i) => `${i + 1}. ${s.title || 'Document'}${s.citation ? ' · ' + s.citation : (s.page ? ' · page ' + s.page : '')}${s.chunk ? ' · chunk ' + s.chunk : ''}`);
             return `${text}\n\n**Sources**\n${lines.join('\n')}`;
         }
 
@@ -2441,7 +2441,7 @@ RULES:
                     <div class="att-ico">${attachmentIcon(att)}</div>
                     <div class="att-meta">
                         <div class="att-name">${esc(att.filename || att.name)}</div>
-                        <div class="att-sub">${esc(att.media_kind || 'file')} · ${formatBytes(att.size_bytes || att.size || 0)} · ${att.status}</div>
+                        <div class="att-sub">${esc(att.media_kind || 'file')} · ${formatBytes(att.size_bytes || att.size || 0)} · ${att.status}${att.status === 'ready' && Number(att.text_chars || 0) === 0 && att.media_kind === 'document' ? ' · no text extracted' : ''}</div>
                     </div>
                     <button class="att-x" type="button" onclick="removeDraftAttachment('${att.localId}')">×</button>
                     <div class="att-progress"><span style="width:${att.progress || 0}%"></span></div>
@@ -2832,7 +2832,7 @@ RULES:
                     <div class="att-ico">${attachmentIcon(att)}</div>
                     <div class="att-meta">
                         <div class="att-name">${esc(att.filename || att.name || 'Attachment')}</div>
-                        <div class="att-sub">${esc(att.media_kind || 'file')} · ${formatBytes(att.size_bytes || att.size || 0)}${att.text_chars ? ' · ' + att.text_chars + ' chars' : ''}</div>
+                        <div class="att-sub">${esc(att.media_kind || 'file')} · ${formatBytes(att.size_bytes || att.size || 0)}${att.text_chars ? ' · ' + att.text_chars + ' chars' : (att.media_kind === 'document' ? ' · no text extracted' : '')}</div>
                     </div>
                     ${removable ? `<button class="att-x" type="button">×</button>` : '<span></span>'}
                 </div>
