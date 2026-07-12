@@ -41,6 +41,13 @@ CORS(app)
 init_db()
 
 
+@app.errorhandler(Exception)
+def handle_unexpected_error(exc):
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "Backend error", "details": str(exc)}), 500
+    raise exc
+
+
 @app.after_request
 def add_cors_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
@@ -283,6 +290,34 @@ def uploaded_document_status_context(user_id, query, document_context, chat_id=N
     )
 
 
+def client_attachment_status_context(raw_messages, user_id, chat_id):
+    attachments = []
+    for msg in raw_messages or []:
+        if isinstance(msg, dict) and isinstance(msg.get("attachments"), list):
+            attachments.extend(att for att in msg["attachments"] if isinstance(att, dict))
+    if not attachments:
+        return ""
+
+    server_docs = list_documents(user_id, chat_id) if chat_id else []
+    if server_docs:
+        return ""
+
+    listed = "\n".join(
+        f"- {clean_text(att.get('filename') or att.get('name') or 'attached file')} "
+        f"({clean_text(att.get('media_kind') or 'file')}, {int(att.get('text_chars') or 0)} text chars reported by browser)"
+        for att in attachments[:8]
+    )
+    return (
+        "The chat history contains attachment cards, but the server cannot find the uploaded file records/chunks "
+        "for this conversation. This commonly happens after a Render redeploy/restart when uploads are stored on "
+        "ephemeral disk, or when a chat was restored from browser localStorage without server-side files. "
+        "Do not say the user never attached a file. Explain that the attachment card is visible but the backend "
+        "cannot access the file content anymore, and ask the user to re-upload the PDF after deployment or enable "
+        "persistent storage.\n\n"
+        f"Attachment cards seen in chat history:\n{listed}"
+    )
+
+
 def call_groq(messages, context_prompt, system_prompt=None):
     if not GROQ_API_KEY:
         raise RuntimeError("Groq API key is missing.")
@@ -443,7 +478,8 @@ def chat():
         return jsonify({"error": "Add at least one API key: GROQ_API_KEY, GEMINI_API_KEY, or CLAUDE_API_KEY."}), 500
 
     data = request.get_json(silent=True) or {}
-    messages = normalize_messages(data.get("messages", []))
+    raw_messages = data.get("messages", [])
+    messages = normalize_messages(raw_messages)
     chat_id = clean_text(data.get("chat_id", ""))[:128]
     title = clean_text(data.get("title", ""))[:160]
     user_id = get_user_id(request)
@@ -480,7 +516,10 @@ def chat():
         document_context if has_text_source else "",
         chat_id,
     )
-    combined_context = "\n\n---\n\n".join(part for part in [website_context, document_context, upload_status_context] if part)
+    client_attachment_context = client_attachment_status_context(raw_messages, user_id, chat_id)
+    combined_context = "\n\n---\n\n".join(
+        part for part in [website_context, document_context, upload_status_context, client_attachment_context] if part
+    )
     context_prompt = context_message(combined_context)
 
     try:
