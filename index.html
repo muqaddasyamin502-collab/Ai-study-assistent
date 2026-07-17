@@ -2616,6 +2616,17 @@ RULES:
             speechStream = null;
         }
 
+        function micErrorMessage(error) {
+            const code = error && (error.error || error.name);
+            if (code === 'not-allowed' || code === 'NotAllowedError') {
+                return 'Microphone permission is blocked. Allow mic access in browser settings.';
+            }
+            if (code === 'no-speech') return 'No speech detected. Please try again and speak clearly.';
+            if (code === 'audio-capture' || code === 'NotFoundError') return 'No microphone was found on this device.';
+            if (code === 'network') return 'Voice recognition needs an internet connection in this browser.';
+            return `Mic error: ${code || 'could not start'}`;
+        }
+
         function resetSilenceTimer() {
             clearTimeout(silenceTimer);
             silenceTimer = setTimeout(() => {
@@ -2628,18 +2639,11 @@ RULES:
 
         async function startVoiceInput() {
             if (!window.isSecureContext) {
-                return toast('Mic needs localhost or HTTPS. Open http://127.0.0.1:5000', true);
+                return toast('Mic needs HTTPS on Render or localhost while testing.', true);
             }
             const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
             if (!SpeechRecognition) return toast('Voice input is supported in Chrome/Edge. Please use one of those browsers.', true);
             cancelVoiceInput(false);
-            try {
-                speechStream = await navigator.mediaDevices.getUserMedia({
-                    audio: { noiseSuppression: true, echoCancellation: true, autoGainControl: true }
-                });
-            } catch (err) {
-                return toast('Microphone permission is blocked. Allow mic access in browser settings.', true);
-            }
             const rec = new SpeechRecognition();
             speechRec = rec;
             speechPaused = false;
@@ -2668,10 +2672,7 @@ RULES:
                 resize(ta);
             };
             rec.onerror = e => {
-                const reason = e.error === 'not-allowed'
-                    ? 'Microphone permission is blocked. Allow mic access in browser settings.'
-                    : `Mic error: ${e.error || 'permission denied'}`;
-                toast(reason, true);
+                toast(micErrorMessage(e), true);
             };
             rec.onend = () => {
                 clearTimeout(silenceTimer);
@@ -2688,11 +2689,23 @@ RULES:
                 if (ta) delete ta.dataset.finalTranscript;
             };
             try {
+                if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+                    navigator.mediaDevices.getUserMedia({
+                        audio: { noiseSuppression: true, echoCancellation: true, autoGainControl: true }
+                    }).then(stream => {
+                        speechStream = stream;
+                    }).catch(err => {
+                        if (!speechRec) return;
+                        toast(micErrorMessage(err), true);
+                        try { speechRec.abort(); } catch {}
+                    });
+                }
                 rec.start();
             } catch (err) {
                 stopSpeechStream();
+                speechRec = null;
                 setRecPanel(false);
-                toast('Mic could not start. Please try again.', true);
+                toast(micErrorMessage(err), true);
             }
         }
 
