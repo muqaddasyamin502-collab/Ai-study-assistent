@@ -77,7 +77,7 @@ GROQ_MODEL = clean_env_value(os.getenv("GROQ_MODEL"))
 if not GROQ_MODEL:
     old_model = clean_env_value(os.getenv("GROK_MODEL"))
     GROQ_MODEL = old_model if old_model and not old_model.lower().startswith("grok-") else "llama-3.3-70b-versatile"
-GROQ_VISION_MODEL = clean_env_value(os.getenv("GROQ_VISION_MODEL"))
+GROQ_VISION_MODEL = clean_env_value(os.getenv("GROQ_VISION_MODEL")) or "meta-llama/llama-4-scout-17b-16e-instruct"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 GEMINI_API_KEY = clean_env_value(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
@@ -241,6 +241,39 @@ def readable_groq_error(error_detail):
     return str(error_detail)
 
 
+def user_safe_provider_error(provider, exc, vision_attachments=None):
+    text = str(exc)
+    lower = text.lower()
+    if provider == "Gemini" and ("api_key_invalid" in lower or "api key not valid" in lower):
+        return "Gemini API key is invalid. Add a valid GEMINI_API_KEY in Render environment variables."
+    if provider == "Gemini" and ("not found" in lower or "model" in lower and "invalid" in lower):
+        return f"Gemini model is not available: {GEMINI_MODEL}. Update GEMINI_MODEL in Render."
+    if provider == "Claude" and ("credit balance" in lower or "billing" in lower):
+        return "Claude account has no available credits. Add credits or remove CLAUDE_API_KEY from Render."
+    if provider == "Groq" and "groq_vision_model" in lower:
+        return "Groq image vision is not configured. Set GROQ_VISION_MODEL to a Groq vision-capable model."
+    if "api key" in lower:
+        return f"{provider} API key is invalid or missing."
+    if vision_attachments:
+        return f"{provider} could not process the uploaded image."
+    return f"{provider} is not available right now."
+
+
+def all_providers_failed_message(errors, vision_attachments=None):
+    if vision_attachments:
+        return (
+            "Groq image understanding is connected, but Groq could not answer this image request.\n\n"
+            + "\n".join(f"- {error}" for error in errors)
+            + "\n\nCheck Render env vars: GROQ_API_KEY must be valid and GROQ_VISION_MODEL should be "
+            "meta-llama/llama-4-scout-17b-16e-instruct. Then redeploy and upload the image again."
+        )
+    return (
+        "The AI providers are not available right now.\n\n"
+        + "\n".join(f"- {error}" for error in errors)
+        + "\n\nPlease check the API keys and billing settings in Render."
+    )
+
+
 def context_message(website_context):
     if not website_context:
         return "No live website context was needed for this question."
@@ -269,6 +302,19 @@ def asks_about_visual_file(query):
             "attached file",
         ]
     )
+
+
+def latest_user_has_image_attachment(raw_messages):
+    for msg in reversed(raw_messages or []):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        attachments = msg.get("attachments") if isinstance(msg.get("attachments"), list) else []
+        return any(
+            isinstance(att, dict)
+            and clean_text(att.get("media_kind") or "").lower() == "image"
+            for att in attachments
+        )
+    return False
 
 
 def asks_about_uploaded_notes(query):
@@ -508,8 +554,6 @@ def call_claude(messages, context_prompt, system_prompt=None, vision_attachments
 
 def generate_reply(messages, context_prompt, system_prompt=None, vision_attachments=None):
     providers = [
-        ("Gemini", call_gemini),
-        ("Claude", call_claude),
         ("Groq", call_groq),
     ] if vision_attachments else [
         ("Groq", call_groq),
@@ -522,9 +566,9 @@ def generate_reply(messages, context_prompt, system_prompt=None, vision_attachme
             reply = caller(messages, context_prompt, system_prompt, vision_attachments)
             return provider, reply
         except Exception as exc:
-            errors.append(f"{provider}: {exc}")
+            errors.append(user_safe_provider_error(provider, exc, vision_attachments))
             print(f"{provider} API error: {exc}", flush=True)
-    raise RuntimeError(" | ".join(errors))
+    raise RuntimeError(all_providers_failed_message(errors, vision_attachments))
 
 
 @app.get("/")
@@ -542,6 +586,11 @@ def health():
                 "groq_vision": {"model": GROQ_VISION_MODEL, "has_api_key": bool(GROQ_API_KEY and GROQ_VISION_MODEL)},
                 "gemini": {"model": GEMINI_MODEL, "has_api_key": bool(GEMINI_API_KEY)},
                 "claude": {"model": CLAUDE_MODEL, "has_api_key": bool(CLAUDE_API_KEY)},
+            },
+            "vision_ready": bool(GROQ_API_KEY and GROQ_VISION_MODEL),
+            "setup_notes": {
+                "image_questions": "Groq image questions use GROQ_API_KEY plus GROQ_VISION_MODEL.",
+                "render_free_storage": "Uploads on Render free tier are temporary; re-upload files after redeploy/restart.",
             },
             "sources": KNOWLEDGE_SOURCES,
             "prompt_version": LATEST_PROMPT_VERSION,
@@ -595,7 +644,7 @@ def chat():
 
     website_context = build_website_context(latest_user_message)
     document_context, sources = rag_context(user_id, latest_user_message, chat_id)
-    visual_question = asks_about_visual_file(latest_user_message)
+    visual_question = asks_about_visual_file(latest_user_message) or latest_user_has_image_attachment(raw_messages)
     vision_attachments = recent_image_attachments(user_id, chat_id) if visual_question else []
     vision_context = ""
     if vision_attachments:
