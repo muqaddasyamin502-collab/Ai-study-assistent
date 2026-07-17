@@ -24,6 +24,7 @@ from services import (
     list_documents,
     log_activity,
     rag_context,
+    recent_image_attachments,
     restore_data,
     save_document,
     save_lecture_version,
@@ -76,6 +77,7 @@ GROQ_MODEL = clean_env_value(os.getenv("GROQ_MODEL"))
 if not GROQ_MODEL:
     old_model = clean_env_value(os.getenv("GROK_MODEL"))
     GROQ_MODEL = old_model if old_model and not old_model.lower().startswith("grok-") else "llama-3.3-70b-versatile"
+GROQ_VISION_MODEL = clean_env_value(os.getenv("GROQ_VISION_MODEL"))
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 GEMINI_API_KEY = clean_env_value(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
@@ -249,6 +251,26 @@ def context_message(website_context):
     )
 
 
+def asks_about_visual_file(query):
+    q = query.lower()
+    return any(
+        phrase in q
+        for phrase in [
+            "image",
+            "picture",
+            "photo",
+            "screenshot",
+            "diagram",
+            "chart",
+            "graph",
+            "explain this",
+            "what is in this",
+            "describe this",
+            "attached file",
+        ]
+    )
+
+
 def asks_about_uploaded_notes(query):
     q = query.lower()
     return any(
@@ -318,17 +340,40 @@ def client_attachment_status_context(raw_messages, user_id, chat_id):
     )
 
 
-def call_groq(messages, context_prompt, system_prompt=None):
+def groq_messages(messages, context_prompt, system_prompt=None, vision_attachments=None):
+    payload_messages = [
+        {"role": "system", "content": system_prompt or SYSTEM_PROMPT},
+        {"role": "system", "content": context_prompt},
+        *messages,
+    ]
+    if vision_attachments:
+        payload_messages = [dict(message) for message in payload_messages]
+        for message in reversed(payload_messages):
+            if message.get("role") == "user":
+                content = [{"type": "text", "text": message.get("content", "")}]
+                for image in vision_attachments:
+                    content.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{image['content_type']};base64,{image['data']}"
+                            },
+                        }
+                    )
+                message["content"] = content
+                break
+    return payload_messages
+
+
+def call_groq(messages, context_prompt, system_prompt=None, vision_attachments=None):
     if not GROQ_API_KEY:
         raise RuntimeError("Groq API key is missing.")
+    if vision_attachments and not GROQ_VISION_MODEL:
+        raise RuntimeError("GROQ_VISION_MODEL is missing for image questions.")
 
     payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt or SYSTEM_PROMPT},
-            {"role": "system", "content": context_prompt},
-            *messages,
-        ],
+        "model": GROQ_VISION_MODEL if vision_attachments else GROQ_MODEL,
+        "messages": groq_messages(messages, context_prompt, system_prompt, vision_attachments),
         "temperature": 0.4,
         "max_completion_tokens": MAX_OUTPUT_TOKENS,
         "stream": False,
@@ -352,16 +397,29 @@ def call_groq(messages, context_prompt, system_prompt=None):
     return result["choices"][0]["message"]["content"]
 
 
-def call_gemini(messages, context_prompt, system_prompt=None):
+def call_gemini(messages, context_prompt, system_prompt=None, vision_attachments=None):
     if not GEMINI_API_KEY:
         raise RuntimeError("Gemini API key is missing.")
 
     contents = []
-    for msg in messages:
+    image_parts_added = False
+    for index, msg in enumerate(messages):
+        parts = [{"text": msg["content"]}]
+        if vision_attachments and msg["role"] == "user" and not image_parts_added and index == len(messages) - 1:
+            for image in vision_attachments:
+                parts.append(
+                    {
+                        "inline_data": {
+                            "mime_type": image["content_type"],
+                            "data": image["data"],
+                        }
+                    }
+                )
+            image_parts_added = True
         contents.append(
             {
                 "role": "model" if msg["role"] == "assistant" else "user",
-                "parts": [{"text": msg["content"]}],
+                "parts": parts,
             }
         )
 
@@ -394,14 +452,37 @@ def call_gemini(messages, context_prompt, system_prompt=None):
     return result["candidates"][0]["content"]["parts"][0]["text"]
 
 
-def call_claude(messages, context_prompt, system_prompt=None):
+def claude_messages(messages, vision_attachments=None):
+    payload_messages = []
+    image_parts_added = False
+    for index, msg in enumerate(messages):
+        content = msg["content"]
+        if vision_attachments and msg["role"] == "user" and not image_parts_added and index == len(messages) - 1:
+            content = [{"type": "text", "text": msg["content"]}]
+            for image in vision_attachments:
+                content.append(
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": image["content_type"],
+                            "data": image["data"],
+                        },
+                    }
+                )
+            image_parts_added = True
+        payload_messages.append({"role": msg["role"], "content": content})
+    return payload_messages
+
+
+def call_claude(messages, context_prompt, system_prompt=None, vision_attachments=None):
     if not CLAUDE_API_KEY:
         raise RuntimeError("Claude API key is missing.")
 
     payload = {
         "model": CLAUDE_MODEL,
         "system": f"{system_prompt or SYSTEM_PROMPT}\n\n{context_prompt}",
-        "messages": messages,
+        "messages": claude_messages(messages, vision_attachments),
         "temperature": 0.4,
         "max_tokens": MAX_OUTPUT_TOKENS,
     }
@@ -425,8 +506,12 @@ def call_claude(messages, context_prompt, system_prompt=None):
     return "".join(block.get("text", "") for block in result.get("content", []))
 
 
-def generate_reply(messages, context_prompt, system_prompt=None):
+def generate_reply(messages, context_prompt, system_prompt=None, vision_attachments=None):
     providers = [
+        ("Gemini", call_gemini),
+        ("Claude", call_claude),
+        ("Groq", call_groq),
+    ] if vision_attachments else [
         ("Groq", call_groq),
         ("Gemini", call_gemini),
         ("Claude", call_claude),
@@ -434,7 +519,7 @@ def generate_reply(messages, context_prompt, system_prompt=None):
     errors = []
     for provider, caller in providers:
         try:
-            reply = caller(messages, context_prompt, system_prompt)
+            reply = caller(messages, context_prompt, system_prompt, vision_attachments)
             return provider, reply
         except Exception as exc:
             errors.append(f"{provider}: {exc}")
@@ -454,6 +539,7 @@ def health():
             "ok": True,
             "providers": {
                 "groq": {"model": GROQ_MODEL, "has_api_key": bool(GROQ_API_KEY)},
+                "groq_vision": {"model": GROQ_VISION_MODEL, "has_api_key": bool(GROQ_API_KEY and GROQ_VISION_MODEL)},
                 "gemini": {"model": GEMINI_MODEL, "has_api_key": bool(GEMINI_API_KEY)},
                 "claude": {"model": CLAUDE_MODEL, "has_api_key": bool(CLAUDE_API_KEY)},
             },
@@ -509,6 +595,42 @@ def chat():
 
     website_context = build_website_context(latest_user_message)
     document_context, sources = rag_context(user_id, latest_user_message, chat_id)
+    visual_question = asks_about_visual_file(latest_user_message)
+    vision_attachments = recent_image_attachments(user_id, chat_id) if visual_question else []
+    vision_context = ""
+    if vision_attachments:
+        vision_context = (
+            "The latest user question appears to ask about an uploaded image. "
+            "The image file is included as vision input for providers that support images. "
+            "Describe the visible content directly and mention uncertainty only where needed.\n\n"
+            + "\n".join(
+                f"- {image['filename']} ({image['content_type']}, {image['size_bytes']} bytes)"
+                for image in vision_attachments
+            )
+        )
+        sources.extend(
+            {
+                "document_id": image["document_id"],
+                "title": image["filename"],
+                "kind": "image",
+                "vision": True,
+            }
+            for image in vision_attachments
+        )
+    elif visual_question:
+        image_docs = [doc for doc in list_documents(user_id, chat_id) if doc.get("media_kind") == "image"]
+        if image_docs:
+            listed = "\n".join(
+                f"- {doc.get('filename')} ({doc.get('size_bytes', 0)} bytes)"
+                for doc in image_docs[:4]
+            )
+            vision_context = (
+                "The student is asking about an uploaded image, but the backend could not load the image bytes "
+                "for vision analysis. This can happen after a Render restart/redeploy because free-tier local "
+                "uploads are temporary. Do not claim to see the image. Ask the student to re-upload it and then "
+                "answer from the newly uploaded image.\n\n"
+                f"Image records found:\n{listed}"
+            )
     has_text_source = any(source.get("chunk") for source in sources)
     upload_status_context = uploaded_document_status_context(
         user_id,
@@ -518,12 +640,17 @@ def chat():
     )
     client_attachment_context = client_attachment_status_context(raw_messages, user_id, chat_id)
     combined_context = "\n\n---\n\n".join(
-        part for part in [website_context, document_context, upload_status_context, client_attachment_context] if part
+        part for part in [website_context, document_context, vision_context, upload_status_context, client_attachment_context] if part
     )
     context_prompt = context_message(combined_context)
 
     try:
-        provider, reply = generate_reply(messages, context_prompt, (frozen or {}).get("system_prompt") or SYSTEM_PROMPT)
+        provider, reply = generate_reply(
+            messages,
+            context_prompt,
+            (frozen or {}).get("system_prompt") or SYSTEM_PROMPT,
+            vision_attachments,
+        )
         updated_messages = [*messages, {"role": "assistant", "content": reply, "sources": sources}]
         if chat_id:
             create_or_update_chat(
