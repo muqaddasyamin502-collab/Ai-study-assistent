@@ -677,6 +677,40 @@ def list_documents(user_id, chat_id=None):
     return [dict(row) for row in rows]
 
 
+def recent_image_attachments(user_id, chat_id=None, limit=4):
+    if not chat_id:
+        return []
+    with db() as conn:
+        rows = conn.execute(
+            """
+            select id, filename, content_type, path, size_bytes, created_at
+            from documents
+            where owner_id in (?, 'shared') and chat_id = ? and media_kind = 'image'
+            order by created_at desc
+            limit ?
+            """,
+            (user_id, chat_id, limit),
+        ).fetchall()
+    images = []
+    for row in rows:
+        path = Path(row["path"] or "")
+        try:
+            if not path.exists() or path.stat().st_size > MAX_UPLOAD_BYTES:
+                continue
+            images.append(
+                {
+                    "document_id": row["id"],
+                    "filename": row["filename"],
+                    "content_type": row["content_type"] or "image/png",
+                    "data": base64.b64encode(path.read_bytes()).decode("ascii"),
+                    "size_bytes": row["size_bytes"] or path.stat().st_size,
+                }
+            )
+        except Exception:
+            continue
+    return images
+
+
 def tokenize(text):
     return re.findall(r"[A-Za-z0-9\u0600-\u06FF]{3,}", (text or "").lower())
 
@@ -818,11 +852,18 @@ def attachment_context(user_id, chat_id):
     sources = []
     for doc in docs[:12]:
         text_chars = doc.get("text_chars", 0)
-        readability = (
-            "Readable text is available."
-            if text_chars
-            else "No readable text was extracted. If the user asks to summarize or answer from this file, say the file is attached but appears scanned/image-only/unreadable on the server; ask for a text-based PDF, OCR copy, or pasted text."
-        )
+        if doc.get("media_kind") == "image":
+            readability = (
+                "OCR text is available and the image may also be available to a vision model."
+                if text_chars
+                else "Image is attached. Use vision input if it is available; if no vision input is provided, explain that the image file is attached but cannot be visually inspected by the current provider."
+            )
+        else:
+            readability = (
+                "Readable text is available."
+                if text_chars
+                else "No readable text was extracted. If the user asks to summarize or answer from this file, say the file is attached but appears scanned/image-only/unreadable on the server; ask for a text-based PDF, OCR copy, or pasted text."
+            )
         lines.append(
             f"- {doc.get('filename')} ({doc.get('media_kind') or 'file'}, {text_chars} text chars): {doc.get('summary') or ''} {readability}"
         )
