@@ -38,6 +38,7 @@ MAX_RAG_CHUNKS = int(os.getenv("MAX_RAG_CHUNKS", "10"))
 LATEST_PROMPT_VERSION = os.getenv("SYSTEM_PROMPT_VERSION", "2026-07-10")
 GROQ_AUDIO_TRANSCRIPTION_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_TRANSCRIPTION_MODEL = os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo")
+PDF_OCR_MAX_PAGES = int(os.getenv("PDF_OCR_MAX_PAGES", "25"))
 
 
 class TextOnlyHTMLParser(HTMLParser):
@@ -366,36 +367,79 @@ def extract_csv_segments(raw):
 
 
 def extract_pdf(raw):
-    try:
-        from pypdf import PdfReader
-    except Exception:
-        return ""
-    reader = PdfReader(io.BytesIO(raw))
-    return "\n".join(page.extract_text() or "" for page in reader.pages)
+    return "\n".join(segment["text"] for segment in extract_pdf_segments(raw))
 
 
 def extract_pdf_segments(raw):
+    segments = []
+
     try:
         from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(raw))
+        for index, page in enumerate(reader.pages, start=1):
+            seg = make_segment(page.extract_text() or "", "page", f"Page {index}", index)
+            if seg:
+                segments.append(seg)
     except Exception:
-        return []
-    segments = []
-    reader = PdfReader(io.BytesIO(raw))
-    for index, page in enumerate(reader.pages, start=1):
-        seg = make_segment(page.extract_text() or "", "page", f"Page {index}", index)
-        if seg:
-            segments.append(seg)
+        pass
+
+    try:
+        import fitz
+
+        doc = fitz.open(stream=raw, filetype="pdf")
+        existing_pages = {segment["page_number"] for segment in segments if segment.get("page_number")}
+        for index, page in enumerate(doc, start=1):
+            if index in existing_pages:
+                continue
+            seg = make_segment(page.get_text("text") or "", "page", f"Page {index}", index)
+            if seg:
+                segments.append(seg)
+                existing_pages.add(index)
+
+        if len(existing_pages) < len(doc):
+            try:
+                from PIL import Image
+
+                for index, page in enumerate(doc, start=1):
+                    if index in existing_pages or index > PDF_OCR_MAX_PAGES:
+                        continue
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                    image = Image.open(io.BytesIO(pix.tobytes("png")))
+                    text = ocr_image_text(image)
+                    seg = make_segment(text, "page", f"Page {index} OCR", index)
+                    if seg:
+                        segments.append(seg)
+                        existing_pages.add(index)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    segments.sort(key=lambda segment: segment.get("page_number") or 0)
     return segments
+
+
+def ocr_image_text(image):
+    try:
+        import pytesseract
+    except Exception:
+        return ""
+    for lang in ("eng+urd", "eng", None):
+        try:
+            return pytesseract.image_to_string(image, lang=lang) if lang else pytesseract.image_to_string(image)
+        except Exception:
+            continue
+    return ""
 
 
 def extract_image(raw):
     try:
-        import pytesseract
         from PIL import Image
     except Exception:
         return ""
     image = Image.open(io.BytesIO(raw))
-    return pytesseract.image_to_string(image)
+    return ocr_image_text(image)
 
 
 def extract_image_segments(raw):
