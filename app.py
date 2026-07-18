@@ -25,6 +25,7 @@ from services import (
     log_activity,
     rag_context,
     recent_image_attachments,
+    recent_pdf_page_attachments,
     restore_data,
     save_document,
     save_lecture_version,
@@ -333,6 +334,19 @@ def asks_about_uploaded_notes(query):
             "summary",
         ]
     )
+
+
+def latest_user_has_document_attachment(raw_messages):
+    for msg in reversed(raw_messages or []):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        attachments = msg.get("attachments") if isinstance(msg.get("attachments"), list) else []
+        return any(
+            isinstance(att, dict)
+            and clean_text(att.get("media_kind") or "").lower() == "document"
+            for att in attachments
+        )
+    return False
 
 
 def uploaded_document_status_context(user_id, query, document_context, chat_id=None):
@@ -644,6 +658,7 @@ def chat():
 
     website_context = build_website_context(latest_user_message)
     document_context, sources = rag_context(user_id, latest_user_message, chat_id)
+    document_question = asks_about_uploaded_notes(latest_user_message) or latest_user_has_document_attachment(raw_messages)
     visual_question = asks_about_visual_file(latest_user_message) or latest_user_has_image_attachment(raw_messages)
     vision_attachments = recent_image_attachments(user_id, chat_id) if visual_question else []
     vision_context = ""
@@ -680,11 +695,35 @@ def chat():
                 "answer from the newly uploaded image.\n\n"
                 f"Image records found:\n{listed}"
             )
+    if not vision_attachments and document_question:
+        pdf_pages = recent_pdf_page_attachments(user_id, chat_id)
+        if pdf_pages:
+            vision_attachments = pdf_pages
+            vision_context = (
+                "The uploaded PDF did not provide enough searchable text, so selected PDF pages are included "
+                "as vision images. Read the visible page content and answer the user's PDF question from these "
+                "page images. If only some pages are included, say that the answer is based on the visible pages "
+                "provided to vision.\n\n"
+                + "\n".join(
+                    f"- {page['source_filename']} page {page['page_number']} ({page['content_type']}, {page['size_bytes']} bytes)"
+                    for page in pdf_pages
+                )
+            )
+            sources.extend(
+                {
+                    "document_id": page["document_id"],
+                    "title": page["source_filename"],
+                    "kind": "pdf_page_image",
+                    "page": page["page_number"],
+                    "vision": True,
+                }
+                for page in pdf_pages
+            )
     has_text_source = any(source.get("chunk") for source in sources)
     upload_status_context = uploaded_document_status_context(
         user_id,
         latest_user_message,
-        document_context if has_text_source else "",
+        document_context if has_text_source or vision_attachments else "",
         chat_id,
     )
     client_attachment_context = client_attachment_status_context(raw_messages, user_id, chat_id)
