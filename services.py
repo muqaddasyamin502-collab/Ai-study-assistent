@@ -39,6 +39,9 @@ LATEST_PROMPT_VERSION = os.getenv("SYSTEM_PROMPT_VERSION", "2026-07-10")
 GROQ_AUDIO_TRANSCRIPTION_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_TRANSCRIPTION_MODEL = os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo")
 PDF_OCR_MAX_PAGES = int(os.getenv("PDF_OCR_MAX_PAGES", "25"))
+VISION_IMAGE_MAX_BYTES = int(os.getenv("VISION_IMAGE_MAX_BYTES", str(3_500_000)))
+VISION_IMAGE_MAX_DIMENSION = int(os.getenv("VISION_IMAGE_MAX_DIMENSION", "1600"))
+PDF_VISION_MAX_PAGES = int(os.getenv("PDF_VISION_MAX_PAGES", "4"))
 
 
 class TextOnlyHTMLParser(HTMLParser):
@@ -677,6 +680,27 @@ def list_documents(user_id, chat_id=None):
     return [dict(row) for row in rows]
 
 
+def prepare_vision_image(raw, content_type):
+    if len(raw) <= VISION_IMAGE_MAX_BYTES and content_type in {"image/jpeg", "image/png", "image/webp"}:
+        return raw, content_type or "image/jpeg"
+    try:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(raw))
+        image.thumbnail((VISION_IMAGE_MAX_DIMENSION, VISION_IMAGE_MAX_DIMENSION))
+        if image.mode not in {"RGB", "L"}:
+            image = image.convert("RGB")
+        for quality in (85, 75, 65, 55):
+            output = io.BytesIO()
+            image.save(output, format="JPEG", quality=quality, optimize=True)
+            prepared = output.getvalue()
+            if len(prepared) <= VISION_IMAGE_MAX_BYTES or quality == 55:
+                return prepared, "image/jpeg"
+    except Exception:
+        pass
+    return raw, content_type or "image/jpeg"
+
+
 def recent_image_attachments(user_id, chat_id=None, limit=4):
     if not chat_id:
         return []
@@ -697,18 +721,70 @@ def recent_image_attachments(user_id, chat_id=None, limit=4):
         try:
             if not path.exists() or path.stat().st_size > MAX_UPLOAD_BYTES:
                 continue
+            raw, content_type = prepare_vision_image(path.read_bytes(), row["content_type"] or "image/jpeg")
+            if len(raw) > VISION_IMAGE_MAX_BYTES:
+                continue
             images.append(
                 {
                     "document_id": row["id"],
                     "filename": row["filename"],
-                    "content_type": row["content_type"] or "image/png",
-                    "data": base64.b64encode(path.read_bytes()).decode("ascii"),
+                    "content_type": content_type,
+                    "data": base64.b64encode(raw).decode("ascii"),
                     "size_bytes": row["size_bytes"] or path.stat().st_size,
                 }
             )
         except Exception:
             continue
     return images
+
+
+def recent_pdf_page_attachments(user_id, chat_id=None, limit=1, max_pages=PDF_VISION_MAX_PAGES):
+    if not chat_id:
+        return []
+    with db() as conn:
+        rows = conn.execute(
+            """
+            select id, filename, content_type, path, size_bytes, created_at, length(coalesce(text,'')) as text_chars
+            from documents
+            where owner_id in (?, 'shared') and chat_id = ? and media_kind = 'document'
+                  and lower(filename) like '%.pdf'
+            order by created_at desc
+            limit ?
+            """,
+            (user_id, chat_id, limit),
+        ).fetchall()
+    pages = []
+    try:
+        import fitz
+    except Exception:
+        return pages
+    for row in rows:
+        path = Path(row["path"] or "")
+        try:
+            if not path.exists() or path.stat().st_size > MAX_UPLOAD_BYTES:
+                continue
+            doc = fitz.open(path)
+            for page_index, page in enumerate(doc, start=1):
+                if page_index > max_pages:
+                    break
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                raw, content_type = prepare_vision_image(pix.tobytes("png"), "image/png")
+                if len(raw) > VISION_IMAGE_MAX_BYTES:
+                    continue
+                pages.append(
+                    {
+                        "document_id": row["id"],
+                        "filename": f"{row['filename']} page {page_index}",
+                        "content_type": content_type,
+                        "data": base64.b64encode(raw).decode("ascii"),
+                        "size_bytes": len(raw),
+                        "page_number": page_index,
+                        "source_filename": row["filename"],
+                    }
+                )
+        except Exception:
+            continue
+    return pages
 
 
 def tokenize(text):
