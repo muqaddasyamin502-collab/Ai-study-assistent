@@ -798,6 +798,80 @@ def recent_pdf_page_attachments(user_id, chat_id=None, limit=1, max_pages=PDF_VI
     return pages
 
 
+def refresh_document_text(user_id, document_id, chat_id=None):
+    document_id = clean_text(document_id)[:128]
+    if not document_id:
+        return False
+    with db() as conn:
+        row = conn.execute(
+            """
+            select * from documents
+            where id = ? and owner_id in (?, 'shared')
+            """,
+            (document_id, user_id),
+        ).fetchone()
+    if not row:
+        return False
+    if chat_id and row["owner_id"] != "shared" and clean_text(row["chat_id"] or "") != clean_text(chat_id):
+        return False
+
+    path = Path(row["path"] or "")
+    if not path.exists():
+        return False
+    try:
+        raw = path.read_bytes()
+        if len(raw) > MAX_UPLOAD_BYTES:
+            return False
+        filename = row["filename"]
+        kind = row["media_kind"] or media_kind(filename)
+        segments = extract_segments_from_upload(filename, raw)
+        text = clean_text("\n\n".join(segment["text"] for segment in segments))
+        if not text and kind in {"audio", "video"}:
+            text = transcribe_media_upload(filename, raw, row["content_type"])
+            segments = [seg for seg in [make_segment(text, kind, f"{kind.title()} transcript")] if seg]
+        chunks = chunk_segments(segments)
+        summary = describe_upload(filename, row["content_type"], len(raw), text)
+        now = utc_now()
+        with db() as conn:
+            conn.execute(
+                """
+                update documents
+                set text = ?, media_kind = ?, size_bytes = ?, summary = ?
+                where id = ?
+                """,
+                (text, kind, len(raw), summary, document_id),
+            )
+            conn.execute("delete from document_chunks where document_id = ?", (document_id,))
+            for index, chunk in enumerate(chunks, start=1):
+                conn.execute(
+                    """
+                    insert into document_chunks (
+                        id, document_id, owner_id, chat_id, filename, chunk_index,
+                        locator_type, locator_label, page_number, text, embedding, token_count, created_at
+                    )
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        uuid.uuid4().hex,
+                        document_id,
+                        row["owner_id"],
+                        row["chat_id"],
+                        filename,
+                        index,
+                        chunk["locator_type"],
+                        chunk["locator_label"],
+                        chunk["page_number"],
+                        chunk["text"],
+                        json.dumps(chunk["embedding"], separators=(",", ":")),
+                        chunk["token_count"],
+                        now,
+                    ),
+                )
+        return bool(text)
+    except Exception:
+        return False
+
+
 def document_context_for_ids(user_id, chat_id, document_ids, limit=16):
     ids = [clean_text(doc_id)[:128] for doc_id in document_ids or [] if clean_text(doc_id)]
     if not ids:
@@ -808,6 +882,21 @@ def document_context_for_ids(user_id, chat_id, document_ids, limit=16):
     if chat_id:
         chat_clause = " and (chat_id = ? or owner_id = 'shared')"
         params.append(chat_id)
+
+    with db() as conn:
+        docs = conn.execute(
+            f"""
+            select id, filename, media_kind, summary, text, created_at
+            from documents
+            where owner_id in (?, 'shared') and id in ({placeholders}){chat_clause}
+            order by created_at desc
+            """,
+            params,
+        ).fetchall()
+
+    for doc in docs:
+        if not clean_text(doc["text"] or ""):
+            refresh_document_text(user_id, doc["id"], chat_id)
 
     with db() as conn:
         chunks = conn.execute(
@@ -860,7 +949,16 @@ def document_context_for_ids(user_id, chat_id, document_ids, limit=16):
             sources.append({"document_id": doc["id"], "title": doc["filename"], "kind": doc["media_kind"]})
 
     if not parts:
-        return "", [{"document_id": doc["id"], "title": doc["filename"], "kind": doc["media_kind"]} for doc in docs]
+        lines = [
+            f"- {doc['filename']} ({doc['media_kind'] or 'file'}): no readable text or transcript could be extracted"
+            for doc in docs
+        ]
+        return (
+            "The user's latest message includes attached files, but the backend could not extract readable text "
+            "or a transcript from them even after retrying extraction. Tell the user OCR/transcription failed for "
+            "these files and ask for a clearer text-based file or pasted text.\n\n"
+            + "\n".join(lines)
+        ), [{"document_id": doc["id"], "title": doc["filename"], "kind": doc["media_kind"]} for doc in docs]
 
     instruction = (
         "The user's latest message includes these attached file contents. "
