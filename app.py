@@ -18,6 +18,7 @@ from services import (
     dashboard,
     db,
     dependency_status,
+    document_context_for_ids,
     export_chat,
     get_profile,
     get_user_id,
@@ -310,17 +311,20 @@ def asks_about_visual_file(query):
     )
 
 
-def latest_user_has_image_attachment(raw_messages):
+def latest_user_attachments(raw_messages):
     for msg in reversed(raw_messages or []):
         if not isinstance(msg, dict) or msg.get("role") != "user":
             continue
         attachments = msg.get("attachments") if isinstance(msg.get("attachments"), list) else []
-        return any(
-            isinstance(att, dict)
-            and clean_text(att.get("media_kind") or "").lower() == "image"
-            for att in attachments
-        )
-    return False
+        return [att for att in attachments if isinstance(att, dict)]
+    return []
+
+
+def latest_user_has_image_attachment(raw_messages):
+    return any(
+        clean_text(att.get("media_kind") or "").lower() == "image"
+        for att in latest_user_attachments(raw_messages)
+    )
 
 
 def asks_about_uploaded_notes(query):
@@ -342,16 +346,23 @@ def asks_about_uploaded_notes(query):
 
 
 def latest_user_has_document_attachment(raw_messages):
-    for msg in reversed(raw_messages or []):
-        if not isinstance(msg, dict) or msg.get("role") != "user":
+    return any(
+        clean_text(att.get("media_kind") or "").lower() in {"document", "audio", "video"}
+        for att in latest_user_attachments(raw_messages)
+    )
+
+
+def latest_user_attachment_ids(raw_messages, media_kinds=None):
+    allowed = set(media_kinds or [])
+    ids = []
+    for att in latest_user_attachments(raw_messages):
+        kind = clean_text(att.get("media_kind") or "").lower()
+        if allowed and kind not in allowed:
             continue
-        attachments = msg.get("attachments") if isinstance(msg.get("attachments"), list) else []
-        return any(
-            isinstance(att, dict)
-            and clean_text(att.get("media_kind") or "").lower() == "document"
-            for att in attachments
-        )
-    return False
+        doc_id = clean_text(att.get("id") or att.get("document_id") or "")
+        if doc_id:
+            ids.append(doc_id)
+    return ids
 
 
 def uploaded_document_status_context(user_id, query, document_context, chat_id=None):
@@ -574,10 +585,6 @@ def call_claude(messages, context_prompt, system_prompt=None, vision_attachments
 def generate_reply(messages, context_prompt, system_prompt=None, vision_attachments=None):
     providers = [
         ("Groq", call_groq),
-    ] if vision_attachments else [
-        ("Groq", call_groq),
-        ("Gemini", call_gemini),
-        ("Claude", call_claude),
     ]
     errors = []
     for provider, caller in providers:
@@ -629,8 +636,8 @@ def firebase_config():
 
 @app.post("/api/chat")
 def chat():
-    if not any([GROQ_API_KEY, GEMINI_API_KEY, CLAUDE_API_KEY]):
-        return jsonify({"error": "Add at least one API key: GROQ_API_KEY, GEMINI_API_KEY, or CLAUDE_API_KEY."}), 500
+    if not GROQ_API_KEY:
+        return jsonify({"error": "Add GROQ_API_KEY in Render environment variables."}), 500
 
     data = request.get_json(silent=True) or {}
     raw_messages = data.get("messages", [])
@@ -662,10 +669,36 @@ def chat():
             metadata,
         )
 
+    latest_has_document = latest_user_has_document_attachment(raw_messages)
+    latest_has_image = latest_user_has_image_attachment(raw_messages)
+    latest_document_ids = latest_user_attachment_ids(raw_messages, {"document", "audio", "video"})
+    chat_documents = list_documents(user_id, chat_id) if chat_id else []
+    short_prompt = len(latest_user_message.split()) <= 4
+    if short_prompt and not latest_document_ids and chat_documents:
+        latest_doc = chat_documents[0]
+        latest_kind = clean_text(latest_doc.get("media_kind") or "").lower()
+        if latest_kind in {"document", "audio", "video"}:
+            latest_document_ids = [latest_doc["id"]]
+            latest_has_document = True
+        elif latest_kind == "image":
+            latest_has_image = True
+    document_question = asks_about_uploaded_notes(latest_user_message) or latest_has_document
+    visual_question = asks_about_visual_file(latest_user_message) or latest_has_image
+    rag_query = latest_user_message
+    if latest_has_document and short_prompt:
+        rag_query = f"{latest_user_message} summarize explain the attached document"
+
     website_context = build_website_context(latest_user_message)
-    document_context, sources = rag_context(user_id, latest_user_message, chat_id)
-    document_question = asks_about_uploaded_notes(latest_user_message) or latest_user_has_document_attachment(raw_messages)
-    visual_question = asks_about_visual_file(latest_user_message) or latest_user_has_image_attachment(raw_messages)
+    document_context, sources = rag_context(user_id, rag_query, chat_id)
+    direct_document_context, direct_sources = document_context_for_ids(user_id, chat_id, latest_document_ids)
+    if direct_document_context:
+        document_context = "\n\n---\n\n".join(part for part in [direct_document_context, document_context] if part)
+        seen_sources = {(source.get("document_id"), source.get("chunk"), source.get("page")) for source in sources}
+        for source in direct_sources:
+            key = (source.get("document_id"), source.get("chunk"), source.get("page"))
+            if key not in seen_sources:
+                sources.append(source)
+                seen_sources.add(key)
     vision_attachments = recent_image_attachments(user_id, chat_id) if visual_question else []
     vision_context = ""
     if vision_attachments:
@@ -688,7 +721,7 @@ def chat():
             for image in vision_attachments
         )
     elif visual_question:
-        image_docs = [doc for doc in list_documents(user_id, chat_id) if doc.get("media_kind") == "image"]
+        image_docs = [doc for doc in chat_documents if doc.get("media_kind") == "image"]
         if image_docs:
             listed = "\n".join(
                 f"- {doc.get('filename')} ({doc.get('size_bytes', 0)} bytes)"
@@ -701,7 +734,7 @@ def chat():
                 "answer from the newly uploaded image.\n\n"
                 f"Image records found:\n{listed}"
             )
-    if not vision_attachments and document_question:
+    if not vision_attachments and document_question and not direct_document_context:
         pdf_pages = recent_pdf_page_attachments(user_id, chat_id)
         if pdf_pages:
             vision_attachments = pdf_pages
@@ -733,8 +766,16 @@ def chat():
         chat_id,
     )
     client_attachment_context = client_attachment_status_context(raw_messages, user_id, chat_id)
+    attachment_instruction = ""
+    if latest_has_document:
+        attachment_instruction = (
+            "The user's latest message includes a document attachment. If the prompt is short or vague, "
+            "treat it as a request to explain or summarize the attached document using the document excerpts."
+        )
     combined_context = "\n\n---\n\n".join(
-        part for part in [website_context, document_context, vision_context, upload_status_context, client_attachment_context] if part
+        part
+        for part in [website_context, document_context, vision_context, attachment_instruction, upload_status_context, client_attachment_context]
+        if part
     )
     context_prompt = context_message(combined_context)
 
