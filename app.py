@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request, send_from_directory
 from flask_cors import CORS
+from werkzeug.exceptions import HTTPException
 
 from services import (
     LATEST_PROMPT_VERSION,
@@ -16,6 +17,7 @@ from services import (
     create_or_update_chat,
     dashboard,
     db,
+    dependency_status,
     export_chat,
     get_profile,
     get_user_id,
@@ -39,6 +41,7 @@ load_dotenv()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 app = Flask(__name__, static_folder=BASE_DIR, static_url_path="")
+app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 CORS(app)
 init_db()
 
@@ -46,6 +49,8 @@ init_db()
 @app.errorhandler(Exception)
 def handle_unexpected_error(exc):
     if request.path.startswith("/api/"):
+        if isinstance(exc, HTTPException):
+            return jsonify({"error": exc.name, "details": exc.description}), exc.code or 500
         return jsonify({"error": "Backend error", "details": str(exc)}), 500
     raise exc
 
@@ -602,6 +607,7 @@ def health():
                 "claude": {"model": CLAUDE_MODEL, "has_api_key": bool(CLAUDE_API_KEY)},
             },
             "vision_ready": bool(GROQ_API_KEY and GROQ_VISION_MODEL),
+            "dependencies": dependency_status(),
             "setup_notes": {
                 "image_questions": "Groq image questions use GROQ_API_KEY plus GROQ_VISION_MODEL.",
                 "render_free_storage": "Uploads on Render free tier are temporary; re-upload files after redeploy/restart.",
