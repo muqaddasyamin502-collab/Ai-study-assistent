@@ -8,3 +8,4 @@ PyMuPDF==1.24.9
 Pillow==10.4.0
 pytesseract==0.3.13
 gunicorn==22.0.0
+supabase==2.9.1
