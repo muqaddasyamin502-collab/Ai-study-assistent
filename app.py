@@ -96,6 +96,7 @@ CLAUDE_MODEL = clean_env_value(os.getenv("CLAUDE_MODEL")) or "claude-haiku-4-5"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 MAX_OUTPUT_TOKENS = int(clean_env_value(os.getenv("MAX_OUTPUT_TOKENS")) or "600")
+PDF_VISION_FALLBACK = clean_env_value(os.getenv("PDF_VISION_FALLBACK")).lower() == "true"
 
 FIREBASE_CONFIG = {
     "apiKey": clean_env_value(os.getenv("FIREBASE_API_KEY")),
@@ -734,7 +735,7 @@ def chat():
                 "answer from the newly uploaded image.\n\n"
                 f"Image records found:\n{listed}"
             )
-    if not vision_attachments and document_question and not direct_document_context:
+    if PDF_VISION_FALLBACK and not vision_attachments and document_question and not direct_document_context:
         pdf_pages = recent_pdf_page_attachments(user_id, chat_id)
         if pdf_pages:
             vision_attachments = pdf_pages
