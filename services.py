@@ -798,6 +798,78 @@ def recent_pdf_page_attachments(user_id, chat_id=None, limit=1, max_pages=PDF_VI
     return pages
 
 
+def document_context_for_ids(user_id, chat_id, document_ids, limit=16):
+    ids = [clean_text(doc_id)[:128] for doc_id in document_ids or [] if clean_text(doc_id)]
+    if not ids:
+        return "", []
+    placeholders = ",".join("?" for _ in ids)
+    params = [user_id, *ids]
+    chat_clause = ""
+    if chat_id:
+        chat_clause = " and (chat_id = ? or owner_id = 'shared')"
+        params.append(chat_id)
+
+    with db() as conn:
+        chunks = conn.execute(
+            f"""
+            select * from document_chunks
+            where owner_id in (?, 'shared') and document_id in ({placeholders}){chat_clause}
+            order by created_at desc, document_id, chunk_index asc
+            limit ?
+            """,
+            [*params, limit],
+        ).fetchall()
+        docs = conn.execute(
+            f"""
+            select id, filename, media_kind, summary, text, created_at
+            from documents
+            where owner_id in (?, 'shared') and id in ({placeholders}){chat_clause}
+            order by created_at desc
+            """,
+            params,
+        ).fetchall()
+
+    doc_lookup = {row["id"]: dict(row) for row in docs}
+    sources = []
+    parts = []
+    if chunks:
+        for row in chunks:
+            data = dict(row)
+            doc = doc_lookup.get(data["document_id"], {})
+            title = data.get("filename") or doc.get("filename") or "attached file"
+            citation = chunk_citation(data)
+            parts.append(
+                f"Attached file: {title} ({citation}, chunk {data['chunk_index']})\n{data['text'][:CHUNK_CHARS]}"
+            )
+            sources.append(
+                {
+                    "document_id": data["document_id"],
+                    "title": title,
+                    "chunk": data["chunk_index"],
+                    "page": data.get("page_number"),
+                    "citation": citation,
+                    "kind": doc.get("media_kind"),
+                }
+            )
+    else:
+        for doc in docs:
+            text = clean_text(doc["text"] or "")
+            if not text:
+                continue
+            parts.append(f"Attached file: {doc['filename']}\n{text[:CHUNK_CHARS]}")
+            sources.append({"document_id": doc["id"], "title": doc["filename"], "kind": doc["media_kind"]})
+
+    if not parts:
+        return "", [{"document_id": doc["id"], "title": doc["filename"], "kind": doc["media_kind"]} for doc in docs]
+
+    instruction = (
+        "The user's latest message includes these attached file contents. "
+        "For short prompts like 'explain', 'summarize', 'what is this', or 'tell me', answer from these attached files directly. "
+        "Do not ask what to explain when attached content is available.\n\n"
+    )
+    return instruction + "\n\n---\n\n".join(parts), sources
+
+
 def tokenize(text):
     return re.findall(r"[A-Za-z0-9\u0600-\u06FF]{3,}", (text or "").lower())
 
