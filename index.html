@@ -2262,7 +2262,8 @@ RULES:
             try {
                 return text ? JSON.parse(text) : {};
             } catch {
-                throw new Error(`Backend returned invalid JSON. Open ${backendUrl()} and try again.`);
+                const preview = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+                throw new Error(`Backend returned ${response.status || 'an'} invalid response. ${preview || `Open ${backendUrl()} and try again.`}`);
             }
         }
 
@@ -2805,7 +2806,14 @@ RULES:
             if (!text && !readyAttachments.length) return;
             ensureSession();
             const first = msgs.length === 0;
-            const messageText = text || 'Please review the attached files.';
+            const attachmentKinds = new Set(readyAttachments.map(att => att.media_kind || 'file'));
+            const messageText = text || (
+                attachmentKinds.has('image') ? 'Please explain the attached image.' :
+                attachmentKinds.has('audio') ? 'Please summarize the attached audio.' :
+                attachmentKinds.has('video') ? 'Please summarize the attached video.' :
+                attachmentKinds.has('document') ? 'Please explain the attached document.' :
+                'Please review the attached files.'
+            );
             hideW();
             addMsg('user', messageText, false, readyAttachments);
             ta.value = '';
