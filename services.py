@@ -1,9 +1,11 @@
 import base64
 import csv
+import importlib.util
 import io
 import json
 import os
 import re
+import shutil
 import sqlite3
 import time
 import uuid
@@ -39,9 +41,9 @@ LATEST_PROMPT_VERSION = os.getenv("SYSTEM_PROMPT_VERSION", "2026-07-10")
 GROQ_AUDIO_TRANSCRIPTION_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_TRANSCRIPTION_MODEL = os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo")
 PDF_OCR_MAX_PAGES = int(os.getenv("PDF_OCR_MAX_PAGES", "25"))
-VISION_IMAGE_MAX_BYTES = int(os.getenv("VISION_IMAGE_MAX_BYTES", str(3_500_000)))
-VISION_IMAGE_MAX_DIMENSION = int(os.getenv("VISION_IMAGE_MAX_DIMENSION", "1600"))
-PDF_VISION_MAX_PAGES = int(os.getenv("PDF_VISION_MAX_PAGES", "4"))
+VISION_IMAGE_MAX_BYTES = int(os.getenv("VISION_IMAGE_MAX_BYTES", str(900_000)))
+VISION_IMAGE_MAX_DIMENSION = int(os.getenv("VISION_IMAGE_MAX_DIMENSION", "1000"))
+PDF_VISION_MAX_PAGES = int(os.getenv("PDF_VISION_MAX_PAGES", "2"))
 
 
 class TextOnlyHTMLParser(HTMLParser):
@@ -59,6 +61,15 @@ class TextOnlyHTMLParser(HTMLParser):
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def dependency_status():
+    return {
+        "pymupdf": bool(importlib.util.find_spec("fitz")),
+        "pillow": bool(importlib.util.find_spec("PIL")),
+        "pytesseract": bool(importlib.util.find_spec("pytesseract")),
+        "tesseract_binary": bool(shutil.which("tesseract")),
+    }
 
 
 def ensure_data_dirs():
@@ -767,7 +778,7 @@ def recent_pdf_page_attachments(user_id, chat_id=None, limit=1, max_pages=PDF_VI
             for page_index, page in enumerate(doc, start=1):
                 if page_index > max_pages:
                     break
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.25, 1.25), alpha=False)
                 raw, content_type = prepare_vision_image(pix.tobytes("png"), "image/png")
                 if len(raw) > VISION_IMAGE_MAX_BYTES:
                     continue
