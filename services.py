@@ -5,46 +5,24 @@ import io
 import json
 import os
 import re
+import shutil
+import sqlite3
 import time
 import uuid
+import zipfile
 from collections import Counter
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from xml.etree import ElementTree
-import zipfile
 
 import requests
-from supabase import create_client
 
 
-# ────────────────────────────────────────────────────────────────
-# Supabase client (replaces local SQLite + local disk uploads)
-# ────────────────────────────────────────────────────────────────
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()  # use the service_role key here
-SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "caspam-files").strip()
-
-_supabase_client = None
-
-
-def sb():
-    global _supabase_client
-    if _supabase_client is None:
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            raise RuntimeError(
-                "SUPABASE_URL / SUPABASE_KEY are not set. Add them in Render's Environment tab."
-            )
-        _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    return _supabase_client
-
-
-# ────────────────────────────────────────────────────────────────
-# OCR.space (replaces local pytesseract/tesseract binary, which
-# Render's native Python environment cannot install via Aptfile)
-# ────────────────────────────────────────────────────────────────
-OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "").strip()
-OCR_SPACE_URL = "https://api.ocr.space/parse/image"
+DATA_DIR = Path(os.getenv("CASPAM_DATA_DIR", "instance")).resolve()
+DB_PATH = DATA_DIR / "caspam.db"
+UPLOAD_DIR = DATA_DIR / "uploads"
+BACKUP_DIR = DATA_DIR / "backups"
 
 ALLOWED_EXTENSIONS = {
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".ppt", ".pptx", ".txt",
@@ -87,25 +65,119 @@ def utc_now():
 
 def dependency_status():
     return {
-        "supabase_configured": bool(SUPABASE_URL and SUPABASE_KEY),
-        "ocr_space_configured": bool(OCR_SPACE_API_KEY),
         "pymupdf": bool(importlib.util.find_spec("fitz")),
         "pillow": bool(importlib.util.find_spec("PIL")),
+        "pytesseract": bool(importlib.util.find_spec("pytesseract")),
+        "tesseract_binary": bool(shutil.which("tesseract")),
     }
 
 
+def ensure_data_dirs():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+
 def db():
-    """Backward-compatible alias so `from services import db` still works."""
-    return sb()
+    ensure_data_dirs()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def init_db():
-    """Tables live in Supabase now (see supabase_schema.sql). This just
-    verifies the connection works and logs a clear warning if not."""
-    try:
-        sb().table("profiles").select("user_id").limit(1).execute()
-    except Exception as exc:
-        print(f"[services] Supabase connection check failed: {exc}", flush=True)
+    with db() as conn:
+        conn.executescript(
+            """
+            create table if not exists documents (
+                id text primary key,
+                owner_id text,
+                chat_id text,
+                filename text not null,
+                content_type text,
+                path text not null,
+                text text,
+                media_kind text,
+                size_bytes integer default 0,
+                summary text,
+                created_at text not null
+            );
+            create table if not exists document_chunks (
+                id text primary key,
+                document_id text not null,
+                owner_id text,
+                chat_id text,
+                filename text,
+                chunk_index integer not null,
+                locator_type text,
+                locator_label text,
+                page_number integer,
+                text text not null,
+                embedding text,
+                token_count integer default 0,
+                created_at text not null
+            );
+            create index if not exists idx_document_chunks_owner_chat
+                on document_chunks(owner_id, chat_id, document_id);
+            create index if not exists idx_document_chunks_document
+                on document_chunks(document_id, chunk_index);
+            create table if not exists chats (
+                id text primary key,
+                owner_id text,
+                title text,
+                role text,
+                prompt_version text,
+                system_prompt text,
+                pinned integer default 0,
+                bookmarked integer default 0,
+                metadata text,
+                created_at text not null,
+                updated_at text not null
+            );
+            create table if not exists messages (
+                id text primary key,
+                chat_id text not null,
+                role text not null,
+                content text not null,
+                sources text,
+                created_at text not null
+            );
+            create table if not exists profiles (
+                user_id text primary key,
+                email text,
+                display_name text,
+                role text default 'student',
+                preferences text,
+                updated_at text not null
+            );
+            create table if not exists activity_logs (
+                id text primary key,
+                user_id text,
+                action text not null,
+                details text,
+                created_at text not null
+            );
+            create table if not exists lecture_versions (
+                id text primary key,
+                owner_id text,
+                lecture_id text not null,
+                title text,
+                content text,
+                version integer not null,
+                created_at text not null
+            );
+            """
+        )
+        cols = {row["name"] for row in conn.execute("pragma table_info(documents)").fetchall()}
+        migrations = {
+            "chat_id": "alter table documents add column chat_id text",
+            "media_kind": "alter table documents add column media_kind text",
+            "size_bytes": "alter table documents add column size_bytes integer default 0",
+            "summary": "alter table documents add column summary text",
+        }
+        for col, sql in migrations.items():
+            if col not in cols:
+                conn.execute(sql)
 
 
 def clean_text(text):
@@ -133,43 +205,39 @@ def get_user_role(request):
 
 
 def log_activity(user_id, action, details=None):
-    try:
-        sb().table("activity_logs").insert(
-            {
-                "id": uuid.uuid4().hex,
-                "user_id": user_id,
-                "action": action,
-                "details": json.dumps(details or {}),
-                "created_at": utc_now(),
-            }
-        ).execute()
-    except Exception as exc:
-        print(f"[services] log_activity failed: {exc}", flush=True)
+    with db() as conn:
+        conn.execute(
+            "insert into activity_logs values (?, ?, ?, ?, ?)",
+            (uuid.uuid4().hex, user_id, action, json.dumps(details or {}), utc_now()),
+        )
 
 
 def upsert_profile(user_id, email="", display_name="", role="student", preferences=None):
     role = role if role in {"student", "teacher", "admin"} else "student"
-    sb().table("profiles").upsert(
-        {
-            "user_id": user_id,
-            "email": email,
-            "display_name": display_name,
-            "role": role,
-            "preferences": json.dumps(preferences or {}),
-            "updated_at": utc_now(),
-        }
-    ).execute()
+    with db() as conn:
+        conn.execute(
+            """
+            insert into profiles (user_id, email, display_name, role, preferences, updated_at)
+            values (?, ?, ?, ?, ?, ?)
+            on conflict(user_id) do update set
+                email=excluded.email,
+                display_name=excluded.display_name,
+                role=excluded.role,
+                preferences=excluded.preferences,
+                updated_at=excluded.updated_at
+            """,
+            (user_id, email, display_name, role, json.dumps(preferences or {}), utc_now()),
+        )
     log_activity(user_id, "profile.upsert", {"role": role})
 
 
 def get_profile(user_id):
-    res = sb().table("profiles").select("*").eq("user_id", user_id).limit(1).execute()
-    rows = res.data or []
-    if not rows:
+    with db() as conn:
+        row = conn.execute("select * from profiles where user_id = ?", (user_id,)).fetchone()
+    if not row:
         return {"user_id": user_id, "role": "student", "preferences": {}}
-    data = dict(rows[0])
-    prefs = data.get("preferences") or "{}"
-    data["preferences"] = json.loads(prefs) if isinstance(prefs, str) else (prefs or {})
+    data = dict(row)
+    data["preferences"] = json.loads(data.get("preferences") or "{}")
     return data
 
 
@@ -366,43 +434,17 @@ def extract_pdf_segments(raw):
     return segments
 
 
-def ocr_image_bytes_via_api(image_bytes, filename="image.png", language="eng"):
-    """Cloud OCR via OCR.space — works on Render's native Python runtime
-    without needing the `tesseract` system binary (which Aptfile cannot
-    install there; Aptfile is a Heroku convention, not a Render one)."""
-    if not OCR_SPACE_API_KEY:
-        return ""
-    try:
-        response = requests.post(
-            OCR_SPACE_URL,
-            files={"file": (filename, image_bytes)},
-            data={
-                "apikey": OCR_SPACE_API_KEY,
-                "language": language,
-                "OCREngine": 2,
-                "scale": "true",
-                "isOverlayRequired": "false",
-            },
-            timeout=60,
-        )
-        result = response.json()
-        if result.get("IsErroredOnProcessing"):
-            return ""
-        parsed = result.get("ParsedResults") or []
-        return clean_text(" ".join(p.get("ParsedText", "") for p in parsed))
-    except Exception:
-        return ""
-
-
 def ocr_image_text(image):
-    """`image` is a PIL Image object (kept for compatibility with existing
-    callers); we re-encode it and send it to the OCR.space API."""
     try:
-        buf = io.BytesIO()
-        image.save(buf, format="PNG")
-        return ocr_image_bytes_via_api(buf.getvalue())
+        import pytesseract
     except Exception:
         return ""
+    for lang in ("eng+urd", "eng", None):
+        try:
+            return pytesseract.image_to_string(image, lang=lang) if lang else pytesseract.image_to_string(image)
+        except Exception:
+            continue
+    return ""
 
 
 def extract_image(raw):
@@ -493,16 +535,14 @@ def chunk_segments(segments, max_chars=CHUNK_CHARS, overlap=CHUNK_OVERLAP):
             end = min(len(text), start + max_chars)
             chunk_text = text[start:end].strip()
             if chunk_text:
-                chunks.append(
-                    {
-                        "text": chunk_text,
-                        "locator_type": segment.get("locator_type") or "document",
-                        "locator_label": segment.get("locator_label") or "Document",
-                        "page_number": segment.get("page_number"),
-                        "token_count": len(tokenize(chunk_text)),
-                        "embedding": sparse_embedding(chunk_text),
-                    }
-                )
+                chunks.append({
+                    "text": chunk_text,
+                    "locator_type": segment.get("locator_type") or "document",
+                    "locator_label": segment.get("locator_label") or "Document",
+                    "page_number": segment.get("page_number"),
+                    "token_count": len(tokenize(chunk_text)),
+                    "embedding": sparse_embedding(chunk_text),
+                })
             if end >= len(text):
                 break
             start = max(0, end - overlap)
@@ -551,10 +591,6 @@ def describe_upload(filename, content_type, size_bytes, text):
     return "Document uploaded, but no readable text was extracted."
 
 
-# ────────────────────────────────────────────────────────────────
-# Document storage — files now live in Supabase Storage (permanent),
-# metadata in Supabase Postgres (permanent) instead of local SQLite.
-# ────────────────────────────────────────────────────────────────
 def save_document(user_id, file_storage, chat_id=""):
     filename = safe_filename(file_storage.filename or "upload")
     if not allowed_file(filename):
@@ -562,19 +598,9 @@ def save_document(user_id, file_storage, chat_id=""):
     raw = file_storage.read()
     if len(raw) > MAX_UPLOAD_BYTES:
         raise ValueError("File is too large.")
-
     doc_id = uuid.uuid4().hex
-    storage_path = f"{user_id}/{doc_id}_{filename}"
-
-    try:
-        sb().storage.from_(SUPABASE_BUCKET).upload(
-            storage_path,
-            raw,
-            {"content-type": file_storage.mimetype or "application/octet-stream"},
-        )
-    except Exception as exc:
-        raise ValueError(f"Could not save file to Supabase storage: {exc}")
-
+    target = UPLOAD_DIR / f"{doc_id}_{filename}"
+    target.write_bytes(raw)
     kind = media_kind(filename)
     segments = extract_segments_from_upload(filename, raw)
     text = clean_text("\n\n".join(segment["text"] for segment in segments))
@@ -584,44 +610,39 @@ def save_document(user_id, file_storage, chat_id=""):
     chunks = chunk_segments(segments)
     summary = describe_upload(filename, file_storage.mimetype, len(raw), text)
     now = utc_now()
-
-    sb().table("documents").insert(
-        {
-            "id": doc_id,
-            "owner_id": user_id,
-            "chat_id": clean_text(chat_id)[:128],
-            "filename": filename,
-            "content_type": file_storage.mimetype,
-            "path": storage_path,
-            "text": text,
-            "media_kind": kind,
-            "size_bytes": len(raw),
-            "summary": summary,
-            "created_at": now,
-        }
-    ).execute()
-
-    if chunks:
-        chunk_rows = [
-            {
-                "id": uuid.uuid4().hex,
-                "document_id": doc_id,
-                "owner_id": user_id,
-                "chat_id": clean_text(chat_id)[:128],
-                "filename": filename,
-                "chunk_index": index,
-                "locator_type": chunk["locator_type"],
-                "locator_label": chunk["locator_label"],
-                "page_number": chunk["page_number"],
-                "text": chunk["text"],
-                "embedding": json.dumps(chunk["embedding"], separators=(",", ":")),
-                "token_count": chunk["token_count"],
-                "created_at": now,
-            }
-            for index, chunk in enumerate(chunks, start=1)
-        ]
-        sb().table("document_chunks").insert(chunk_rows).execute()
-
+    with db() as conn:
+        conn.execute(
+            """
+            insert into documents (id, owner_id, chat_id, filename, content_type, path, text, media_kind, size_bytes, summary, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (doc_id, user_id, clean_text(chat_id)[:128], filename, file_storage.mimetype, str(target), text, kind, len(raw), summary, now),
+        )
+        for index, chunk in enumerate(chunks, start=1):
+            conn.execute(
+                """
+                insert into document_chunks (
+                    id, document_id, owner_id, chat_id, filename, chunk_index,
+                    locator_type, locator_label, page_number, text, embedding, token_count, created_at
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    uuid.uuid4().hex,
+                    doc_id,
+                    user_id,
+                    clean_text(chat_id)[:128],
+                    filename,
+                    index,
+                    chunk["locator_type"],
+                    chunk["locator_label"],
+                    chunk["page_number"],
+                    chunk["text"],
+                    json.dumps(chunk["embedding"], separators=(",", ":")),
+                    chunk["token_count"],
+                    now,
+                ),
+            )
     log_activity(user_id, "document.upload", {"document_id": doc_id, "filename": filename, "chat_id": chat_id})
     return {
         "id": doc_id,
@@ -638,47 +659,36 @@ def save_document(user_id, file_storage, chat_id=""):
 
 
 def list_documents(user_id, chat_id=None):
-    query = sb().table("documents").select("*").in_("owner_id", [user_id, "shared"])
-    if chat_id:
-        query = query.or_(f"chat_id.eq.{chat_id},owner_id.eq.shared")
-    docs = (query.order("created_at", desc=True).execute().data) or []
-    if not docs:
-        return []
-
-    doc_ids = [d["id"] for d in docs]
-    chunk_rows = (
-        sb()
-        .table("document_chunks")
-        .select("document_id,page_number")
-        .in_("document_id", doc_ids)
-        .execute()
-        .data
-    ) or []
-    counts = Counter(row["document_id"] for row in chunk_rows)
-    max_pages = {}
-    for row in chunk_rows:
-        pn = row.get("page_number")
-        if pn is not None:
-            max_pages[row["document_id"]] = max(max_pages.get(row["document_id"], 0), pn)
-
-    results = []
-    for doc in docs:
-        results.append(
-            {
-                "id": doc["id"],
-                "chat_id": doc.get("chat_id"),
-                "filename": doc.get("filename"),
-                "content_type": doc.get("content_type"),
-                "media_kind": doc.get("media_kind"),
-                "size_bytes": doc.get("size_bytes"),
-                "summary": doc.get("summary"),
-                "text_chars": len(doc.get("text") or ""),
-                "created_at": doc.get("created_at"),
-                "chunks": counts.get(doc["id"], 0),
-                "pages": max_pages.get(doc["id"]),
-            }
-        )
-    return results
+    with db() as conn:
+        if chat_id:
+            rows = conn.execute(
+                """
+                select d.id, d.chat_id, d.filename, d.content_type, d.media_kind, d.size_bytes, d.summary,
+                       length(coalesce(d.text,'')) as text_chars, d.created_at,
+                       count(c.id) as chunks, max(c.page_number) as pages
+                from documents d
+                left join document_chunks c on c.document_id = d.id
+                where d.owner_id in (?, 'shared') and (d.chat_id = ? or d.owner_id = 'shared')
+                group by d.id
+                order by d.created_at desc
+                """,
+                (user_id, chat_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                select d.id, d.chat_id, d.filename, d.content_type, d.media_kind, d.size_bytes, d.summary,
+                       length(coalesce(d.text,'')) as text_chars, d.created_at,
+                       count(c.id) as chunks, max(c.page_number) as pages
+                from documents d
+                left join document_chunks c on c.document_id = d.id
+                where d.owner_id in (?, 'shared')
+                group by d.id
+                order by d.created_at desc
+                """,
+                (user_id,),
+            ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def prepare_vision_image(raw, content_type):
@@ -705,25 +715,24 @@ def prepare_vision_image(raw, content_type):
 def recent_image_attachments(user_id, chat_id=None, limit=4):
     if not chat_id:
         return []
-    rows = (
-        sb()
-        .table("documents")
-        .select("id,filename,content_type,path,size_bytes,created_at")
-        .in_("owner_id", [user_id, "shared"])
-        .eq("chat_id", chat_id)
-        .eq("media_kind", "image")
-        .order("created_at", desc=True)
-        .limit(limit)
-        .execute()
-        .data
-    ) or []
+    with db() as conn:
+        rows = conn.execute(
+            """
+            select id, filename, content_type, path, size_bytes, created_at
+            from documents
+            where owner_id in (?, 'shared') and chat_id = ? and media_kind = 'image'
+            order by created_at desc
+            limit ?
+            """,
+            (user_id, chat_id, limit),
+        ).fetchall()
     images = []
     for row in rows:
+        path = Path(row["path"] or "")
         try:
-            if (row.get("size_bytes") or 0) > MAX_UPLOAD_BYTES:
+            if not path.exists() or path.stat().st_size > MAX_UPLOAD_BYTES:
                 continue
-            raw = sb().storage.from_(SUPABASE_BUCKET).download(row["path"])
-            raw, content_type = prepare_vision_image(raw, row.get("content_type") or "image/jpeg")
+            raw, content_type = prepare_vision_image(path.read_bytes(), row["content_type"] or "image/jpeg")
             if len(raw) > VISION_IMAGE_MAX_BYTES:
                 continue
             images.append(
@@ -732,7 +741,7 @@ def recent_image_attachments(user_id, chat_id=None, limit=4):
                     "filename": row["filename"],
                     "content_type": content_type,
                     "data": base64.b64encode(raw).decode("ascii"),
-                    "size_bytes": row.get("size_bytes") or len(raw),
+                    "size_bytes": row["size_bytes"] or path.stat().st_size,
                 }
             )
         except Exception:
@@ -743,44 +752,43 @@ def recent_image_attachments(user_id, chat_id=None, limit=4):
 def recent_pdf_page_attachments(user_id, chat_id=None, limit=1, max_pages=PDF_VISION_MAX_PAGES):
     if not chat_id:
         return []
-    rows = (
-        sb()
-        .table("documents")
-        .select("id,filename,content_type,path,size_bytes,created_at,text")
-        .in_("owner_id", [user_id, "shared"])
-        .eq("chat_id", chat_id)
-        .eq("media_kind", "document")
-        .ilike("filename", "%.pdf")
-        .order("created_at", desc=True)
-        .limit(limit)
-        .execute()
-        .data
-    ) or []
+    with db() as conn:
+        rows = conn.execute(
+            """
+            select id, filename, content_type, path, size_bytes, created_at, length(coalesce(text,'')) as text_chars
+            from documents
+            where owner_id in (?, 'shared') and chat_id = ? and media_kind = 'document'
+                  and lower(filename) like '%.pdf'
+            order by created_at desc
+            limit ?
+            """,
+            (user_id, chat_id, limit),
+        ).fetchall()
     pages = []
     try:
         import fitz
     except Exception:
         return pages
     for row in rows:
+        path = Path(row["path"] or "")
         try:
-            if (row.get("size_bytes") or 0) > MAX_UPLOAD_BYTES:
+            if not path.exists() or path.stat().st_size > MAX_UPLOAD_BYTES:
                 continue
-            raw = sb().storage.from_(SUPABASE_BUCKET).download(row["path"])
-            doc = fitz.open(stream=raw, filetype="pdf")
+            doc = fitz.open(path)
             for page_index, page in enumerate(doc, start=1):
                 if page_index > max_pages:
                     break
                 pix = page.get_pixmap(matrix=fitz.Matrix(1.25, 1.25), alpha=False)
-                page_raw, content_type = prepare_vision_image(pix.tobytes("png"), "image/png")
-                if len(page_raw) > VISION_IMAGE_MAX_BYTES:
+                raw, content_type = prepare_vision_image(pix.tobytes("png"), "image/png")
+                if len(raw) > VISION_IMAGE_MAX_BYTES:
                     continue
                 pages.append(
                     {
                         "document_id": row["id"],
                         "filename": f"{row['filename']} page {page_index}",
                         "content_type": content_type,
-                        "data": base64.b64encode(page_raw).decode("ascii"),
-                        "size_bytes": len(page_raw),
+                        "data": base64.b64encode(raw).decode("ascii"),
+                        "size_bytes": len(raw),
                         "page_number": page_index,
                         "source_filename": row["filename"],
                     }
@@ -794,62 +802,71 @@ def refresh_document_text(user_id, document_id, chat_id=None):
     document_id = clean_text(document_id)[:128]
     if not document_id:
         return False
-    rows = (
-        sb()
-        .table("documents")
-        .select("*")
-        .eq("id", document_id)
-        .in_("owner_id", [user_id, "shared"])
-        .limit(1)
-        .execute()
-        .data
-    ) or []
-    if not rows:
+    with db() as conn:
+        row = conn.execute(
+            """
+            select * from documents
+            where id = ? and owner_id in (?, 'shared')
+            """,
+            (document_id, user_id),
+        ).fetchone()
+    if not row:
         return False
-    row = rows[0]
-    if chat_id and row.get("owner_id") != "shared" and clean_text(row.get("chat_id") or "") != clean_text(chat_id):
+    if chat_id and row["owner_id"] != "shared" and clean_text(row["chat_id"] or "") != clean_text(chat_id):
         return False
 
+    path = Path(row["path"] or "")
+    if not path.exists():
+        return False
     try:
-        raw = sb().storage.from_(SUPABASE_BUCKET).download(row["path"])
+        raw = path.read_bytes()
         if len(raw) > MAX_UPLOAD_BYTES:
             return False
         filename = row["filename"]
-        kind = row.get("media_kind") or media_kind(filename)
+        kind = row["media_kind"] or media_kind(filename)
         segments = extract_segments_from_upload(filename, raw)
         text = clean_text("\n\n".join(segment["text"] for segment in segments))
         if not text and kind in {"audio", "video"}:
-            text = transcribe_media_upload(filename, raw, row.get("content_type"))
+            text = transcribe_media_upload(filename, raw, row["content_type"])
             segments = [seg for seg in [make_segment(text, kind, f"{kind.title()} transcript")] if seg]
         chunks = chunk_segments(segments)
-        summary = describe_upload(filename, row.get("content_type"), len(raw), text)
+        summary = describe_upload(filename, row["content_type"], len(raw), text)
         now = utc_now()
-
-        sb().table("documents").update(
-            {"text": text, "media_kind": kind, "size_bytes": len(raw), "summary": summary}
-        ).eq("id", document_id).execute()
-
-        sb().table("document_chunks").delete().eq("document_id", document_id).execute()
-        if chunks:
-            chunk_rows = [
-                {
-                    "id": uuid.uuid4().hex,
-                    "document_id": document_id,
-                    "owner_id": row.get("owner_id"),
-                    "chat_id": row.get("chat_id"),
-                    "filename": filename,
-                    "chunk_index": index,
-                    "locator_type": chunk["locator_type"],
-                    "locator_label": chunk["locator_label"],
-                    "page_number": chunk["page_number"],
-                    "text": chunk["text"],
-                    "embedding": json.dumps(chunk["embedding"], separators=(",", ":")),
-                    "token_count": chunk["token_count"],
-                    "created_at": now,
-                }
-                for index, chunk in enumerate(chunks, start=1)
-            ]
-            sb().table("document_chunks").insert(chunk_rows).execute()
+        with db() as conn:
+            conn.execute(
+                """
+                update documents
+                set text = ?, media_kind = ?, size_bytes = ?, summary = ?
+                where id = ?
+                """,
+                (text, kind, len(raw), summary, document_id),
+            )
+            conn.execute("delete from document_chunks where document_id = ?", (document_id,))
+            for index, chunk in enumerate(chunks, start=1):
+                conn.execute(
+                    """
+                    insert into document_chunks (
+                        id, document_id, owner_id, chat_id, filename, chunk_index,
+                        locator_type, locator_label, page_number, text, embedding, token_count, created_at
+                    )
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        uuid.uuid4().hex,
+                        document_id,
+                        row["owner_id"],
+                        row["chat_id"],
+                        filename,
+                        index,
+                        chunk["locator_type"],
+                        chunk["locator_label"],
+                        chunk["page_number"],
+                        chunk["text"],
+                        json.dumps(chunk["embedding"], separators=(",", ":")),
+                        chunk["token_count"],
+                        now,
+                    ),
+                )
         return bool(text)
     except Exception:
         return False
@@ -859,36 +876,54 @@ def document_context_for_ids(user_id, chat_id, document_ids, limit=16):
     ids = [clean_text(doc_id)[:128] for doc_id in document_ids or [] if clean_text(doc_id)]
     if not ids:
         return "", []
-
-    def fetch_docs():
-        q = (
-            sb()
-            .table("documents")
-            .select("id,filename,media_kind,summary,text,created_at,owner_id,chat_id")
-            .in_("owner_id", [user_id, "shared"])
-            .in_("id", ids)
-        )
-        if chat_id:
-            q = q.or_(f"chat_id.eq.{chat_id},owner_id.eq.shared")
-        return (q.order("created_at", desc=True).execute().data) or []
-
-    docs = fetch_docs()
-    for doc in docs:
-        if not clean_text(doc.get("text") or ""):
-            refresh_document_text(user_id, doc["id"], chat_id)
-    docs = fetch_docs()
-
-    q = sb().table("document_chunks").select("*").in_("owner_id", [user_id, "shared"]).in_("document_id", ids)
+    placeholders = ",".join("?" for _ in ids)
+    params = [user_id, *ids]
+    chat_clause = ""
     if chat_id:
-        q = q.or_(f"chat_id.eq.{chat_id},owner_id.eq.shared")
-    chunks = (q.order("created_at", desc=True).limit(limit).execute().data) or []
-    chunks.sort(key=lambda c: (c.get("document_id") or "", c.get("chunk_index") or 0))
+        chat_clause = " and (chat_id = ? or owner_id = 'shared')"
+        params.append(chat_id)
 
-    doc_lookup = {row["id"]: row for row in docs}
+    with db() as conn:
+        docs = conn.execute(
+            f"""
+            select id, filename, media_kind, summary, text, created_at
+            from documents
+            where owner_id in (?, 'shared') and id in ({placeholders}){chat_clause}
+            order by created_at desc
+            """,
+            params,
+        ).fetchall()
+
+    for doc in docs:
+        if not clean_text(doc["text"] or ""):
+            refresh_document_text(user_id, doc["id"], chat_id)
+
+    with db() as conn:
+        chunks = conn.execute(
+            f"""
+            select * from document_chunks
+            where owner_id in (?, 'shared') and document_id in ({placeholders}){chat_clause}
+            order by created_at desc, document_id, chunk_index asc
+            limit ?
+            """,
+            [*params, limit],
+        ).fetchall()
+        docs = conn.execute(
+            f"""
+            select id, filename, media_kind, summary, text, created_at
+            from documents
+            where owner_id in (?, 'shared') and id in ({placeholders}){chat_clause}
+            order by created_at desc
+            """,
+            params,
+        ).fetchall()
+
+    doc_lookup = {row["id"]: dict(row) for row in docs}
     sources = []
     parts = []
     if chunks:
-        for data in chunks:
+        for row in chunks:
+            data = dict(row)
             doc = doc_lookup.get(data["document_id"], {})
             title = data.get("filename") or doc.get("filename") or "attached file"
             citation = chunk_citation(data)
@@ -907,15 +942,15 @@ def document_context_for_ids(user_id, chat_id, document_ids, limit=16):
             )
     else:
         for doc in docs:
-            text = clean_text(doc.get("text") or "")
+            text = clean_text(doc["text"] or "")
             if not text:
                 continue
             parts.append(f"Attached file: {doc['filename']}\n{text[:CHUNK_CHARS]}")
-            sources.append({"document_id": doc["id"], "title": doc["filename"], "kind": doc.get("media_kind")})
+            sources.append({"document_id": doc["id"], "title": doc["filename"], "kind": doc["media_kind"]})
 
     if not parts:
         lines = [
-            f"- {doc['filename']} ({doc.get('media_kind') or 'file'}): no readable text or transcript could be extracted"
+            f"- {doc['filename']} ({doc['media_kind'] or 'file'}): no readable text or transcript could be extracted"
             for doc in docs
         ]
         return (
@@ -923,7 +958,7 @@ def document_context_for_ids(user_id, chat_id, document_ids, limit=16):
             "or a transcript from them even after retrying extraction. Tell the user OCR/transcription failed for "
             "these files and ask for a clearer text-based file or pasted text.\n\n"
             + "\n".join(lines)
-        ), [{"document_id": doc["id"], "title": doc["filename"], "kind": doc.get("media_kind")} for doc in docs]
+        ), [{"document_id": doc["id"], "title": doc["filename"], "kind": doc["media_kind"]} for doc in docs]
 
     instruction = (
         "The user's latest message includes these attached file contents. "
@@ -974,23 +1009,48 @@ def chunk_citation(chunk):
 
 def best_document_chunks(user_id, query, chat_id=None, limit=MAX_RAG_CHUNKS):
     query_embedding = sparse_embedding(query)
-
-    q = sb().table("document_chunks").select("*").in_("owner_id", [user_id, "shared"])
-    if chat_id:
-        q = q.or_(f"chat_id.eq.{chat_id},owner_id.eq.shared")
-    chunk_rows = (q.execute().data) or []
-
-    rows = []
-    if not chunk_rows:
-        qd = sb().table("documents").select("id,filename,text,created_at").in_("owner_id", [user_id, "shared"])
+    with db() as conn:
         if chat_id:
-            qd = qd.or_(f"chat_id.eq.{chat_id},owner_id.eq.shared")
-        docs = (qd.order("created_at", desc=True).execute().data) or []
-        rows = [d for d in docs if clean_text(d.get("text") or "")]
+            chunk_rows = conn.execute(
+                """
+                select c.* from document_chunks c
+                where c.owner_id in (?, 'shared') and (c.chat_id = ? or c.owner_id = 'shared')
+                order by c.created_at desc, c.chunk_index asc
+                """,
+                (user_id, chat_id),
+            ).fetchall()
+        else:
+            chunk_rows = conn.execute(
+                """
+                select c.* from document_chunks c
+                where c.owner_id in (?, 'shared')
+                order by c.created_at desc, c.chunk_index asc
+                """,
+                (user_id,),
+            ).fetchall()
+
+        if not chunk_rows:
+            if chat_id:
+                rows = conn.execute(
+                    """
+                    select id, filename, text, created_at from documents
+                    where owner_id in (?, 'shared') and (chat_id = ? or owner_id = 'shared') and coalesce(text,'') != ''
+                    order by created_at desc
+                    """,
+                    (user_id, chat_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "select id, filename, text, created_at from documents where owner_id in (?, 'shared') and coalesce(text,'') != '' order by created_at desc",
+                    (user_id,),
+                ).fetchall()
+        else:
+            rows = []
 
     if chunk_rows:
         scored = []
-        for data in chunk_rows:
+        for row in chunk_rows:
+            data = dict(row)
             text = data.get("text") or ""
             lexical = score_text(query, text)
             semantic = sparse_similarity(query_embedding, load_chunk_embedding(data.get("embedding")))
@@ -1001,7 +1061,7 @@ def best_document_chunks(user_id, query, chat_id=None, limit=MAX_RAG_CHUNKS):
         if scored:
             selected = [item[1] for item in scored[:limit]]
         elif wants_document_answer(query):
-            selected = chunk_rows[:limit]
+            selected = [dict(row) for row in chunk_rows[:limit]]
         else:
             selected = []
         return [
@@ -1009,10 +1069,10 @@ def best_document_chunks(user_id, query, chat_id=None, limit=MAX_RAG_CHUNKS):
                 "document_id": row["document_id"],
                 "title": row["filename"],
                 "chunk": row["chunk_index"],
-                "content": (row.get("text") or "")[:CHUNK_CHARS],
-                "locator_type": row.get("locator_type"),
-                "locator_label": row.get("locator_label"),
-                "page_number": row.get("page_number"),
+                "content": row["text"][:CHUNK_CHARS],
+                "locator_type": row["locator_type"],
+                "locator_label": row["locator_label"],
+                "page_number": row["page_number"],
                 "citation": chunk_citation(row),
             }
             for row in selected
@@ -1020,23 +1080,12 @@ def best_document_chunks(user_id, query, chat_id=None, limit=MAX_RAG_CHUNKS):
 
     scored = []
     for row in rows:
-        text = row.get("text") or ""
+        text = row["text"] or ""
         parts = [text[i : i + 1200] for i in range(0, min(len(text), 24000), 1000)]
         for idx, part in enumerate(parts):
             score = score_text(query, part)
             if score:
-                scored.append(
-                    (
-                        score,
-                        {
-                            "document_id": row["id"],
-                            "title": row["filename"],
-                            "chunk": idx + 1,
-                            "content": part[:1200],
-                            "citation": f"chunk {idx + 1}",
-                        },
-                    )
-                )
+                scored.append((score, {"document_id": row["id"], "title": row["filename"], "chunk": idx + 1, "content": part[:1200], "citation": f"chunk {idx + 1}"}))
     scored.sort(key=lambda item: item[0], reverse=True)
     if scored:
         return [item[1] for item in scored[:limit]]
@@ -1046,7 +1095,7 @@ def best_document_chunks(user_id, query, chat_id=None, limit=MAX_RAG_CHUNKS):
 
     fallback = []
     for row in rows[:limit]:
-        text = row.get("text") or ""
+        text = row["text"] or ""
         if text:
             fallback.append({"document_id": row["id"], "title": row["filename"], "chunk": 1, "content": text[:1200], "citation": "chunk 1"})
     return fallback
@@ -1109,77 +1158,57 @@ def rag_context(user_id, query, chat_id=None):
 
 def create_or_update_chat(user_id, chat_id, title, messages, system_prompt, prompt_version, metadata=None):
     now = utc_now()
-    existing_rows = (
-        sb().table("chats").select("system_prompt,prompt_version,created_at").eq("id", chat_id).limit(1).execute().data
-    ) or []
-    existing = existing_rows[0] if existing_rows else None
-    if existing:
-        frozen_prompt = existing["system_prompt"]
-        frozen_version = existing["prompt_version"]
-        created_at = existing["created_at"]
-    else:
-        frozen_prompt = system_prompt
-        frozen_version = prompt_version
-        created_at = now
-
-    sb().table("chats").upsert(
-        {
-            "id": chat_id,
-            "owner_id": user_id,
-            "title": title,
-            "role": None,
-            "prompt_version": frozen_version,
-            "system_prompt": frozen_prompt,
-            "metadata": json.dumps(metadata or {}),
-            "created_at": created_at,
-            "updated_at": now,
-        }
-    ).execute()
-
-    sb().table("messages").delete().eq("chat_id", chat_id).execute()
-    if messages:
-        rows = [
-            {
-                "id": uuid.uuid4().hex,
-                "chat_id": chat_id,
-                "role": message["role"],
-                "content": message["content"],
-                "sources": json.dumps(message.get("sources", [])),
-                "created_at": utc_now(),
-            }
-            for message in messages
-        ]
-        sb().table("messages").insert(rows).execute()
-
+    with db() as conn:
+        existing = conn.execute("select system_prompt, prompt_version, created_at from chats where id = ?", (chat_id,)).fetchone()
+        if existing:
+            frozen_prompt = existing["system_prompt"]
+            frozen_version = existing["prompt_version"]
+            created_at = existing["created_at"]
+        else:
+            frozen_prompt = system_prompt
+            frozen_version = prompt_version
+            created_at = now
+        conn.execute(
+            """
+            insert into chats (id, owner_id, title, role, prompt_version, system_prompt, metadata, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            on conflict(id) do update set
+                title=excluded.title,
+                metadata=excluded.metadata,
+                updated_at=excluded.updated_at
+            """,
+            (chat_id, user_id, title, None, frozen_version, frozen_prompt, json.dumps(metadata or {}), created_at, now),
+        )
+        conn.execute("delete from messages where chat_id = ?", (chat_id,))
+        for message in messages:
+            conn.execute(
+                "insert into messages values (?, ?, ?, ?, ?, ?)",
+                (uuid.uuid4().hex, chat_id, message["role"], message["content"], json.dumps(message.get("sources", [])), utc_now()),
+            )
     return {"system_prompt": frozen_prompt, "prompt_version": frozen_version}
 
 
 def set_chat_flag(user_id, chat_id, flag, value):
     if flag not in {"pinned", "bookmarked"}:
         raise ValueError("Unknown chat flag.")
-    sb().table("chats").update({flag: bool(value), "updated_at": utc_now()}).eq("id", chat_id).eq(
-        "owner_id", user_id
-    ).execute()
+    with db() as conn:
+        conn.execute(f"update chats set {flag} = ?, updated_at = ? where id = ? and owner_id = ?", (1 if value else 0, utc_now(), chat_id, user_id))
     log_activity(user_id, f"chat.{flag}", {"chat_id": chat_id, "value": value})
 
 
 def export_chat(user_id, chat_id, fmt="md"):
-    chats = (
-        sb().table("chats").select("*").eq("id", chat_id).eq("owner_id", user_id).limit(1).execute().data
-    ) or []
-    if not chats:
+    with db() as conn:
+        chat = conn.execute("select * from chats where id = ? and owner_id = ?", (chat_id, user_id)).fetchone()
+        rows = conn.execute("select role, content, sources, created_at from messages where chat_id = ? order by created_at", (chat_id,)).fetchall()
+    if not chat:
         raise ValueError("Chat not found.")
-    chat = chats[0]
-    rows = (
-        sb().table("messages").select("role,content,sources,created_at").eq("chat_id", chat_id).order("created_at").execute().data
-    ) or []
     if fmt == "json":
-        return "application/json", json.dumps({"chat": chat, "messages": rows}, indent=2)
-    lines = [f"# {chat.get('title') or 'CASPAM Chat'}", ""]
+        return "application/json", json.dumps({"chat": dict(chat), "messages": [dict(r) for r in rows]}, indent=2)
+    lines = [f"# {chat['title'] or 'CASPAM Chat'}", ""]
     for row in rows:
         lines.append(f"## {row['role'].title()}")
         lines.append(row["content"])
-        if row.get("sources"):
+        if row["sources"]:
             lines.append("")
             lines.append(f"Sources: {row['sources']}")
         lines.append("")
@@ -1197,16 +1226,14 @@ def suggested_questions(messages, sources=None):
 
 
 def dashboard(user_id, role):
-    docs = len((sb().table("documents").select("id").eq("owner_id", user_id).execute().data) or [])
-    chats_rows = (sb().table("chats").select("id").eq("owner_id", user_id).execute().data) or []
-    chats = len(chats_rows)
-    chat_ids = [row["id"] for row in chats_rows]
-    messages = 0
-    if chat_ids:
-        messages = len((sb().table("messages").select("id").in_("chat_id", chat_ids).execute().data) or [])
-    users = None
-    if role == "admin":
-        users = len((sb().table("profiles").select("user_id").execute().data) or [])
+    with db() as conn:
+        docs = conn.execute("select count(*) as c from documents where owner_id = ?", (user_id,)).fetchone()["c"]
+        chats = conn.execute("select count(*) as c from chats where owner_id = ?", (user_id,)).fetchone()["c"]
+        messages = conn.execute(
+            "select count(*) as c from messages where chat_id in (select id from chats where owner_id = ?)",
+            (user_id,),
+        ).fetchone()["c"]
+        users = conn.execute("select count(*) as c from profiles").fetchone()["c"] if role == "admin" else None
     cards = [
         {"label": "Chats", "value": chats},
         {"label": "Messages", "value": messages},
@@ -1218,12 +1245,11 @@ def dashboard(user_id, role):
 
 
 def analytics(user_id, role):
-    if role == "admin":
-        rows = (sb().table("activity_logs").select("action").execute().data) or []
-    else:
-        rows = (sb().table("activity_logs").select("action").eq("user_id", user_id).execute().data) or []
-    counts = Counter(row["action"] for row in rows)
-    return {"events": [{"action": action, "count": count} for action, count in counts.items()]}
+    with db() as conn:
+        rows = conn.execute("select action, count(*) as count from activity_logs where user_id = ? group by action", (user_id,)).fetchall()
+        if role == "admin":
+            rows = conn.execute("select action, count(*) as count from activity_logs group by action").fetchall()
+    return {"events": [dict(row) for row in rows]}
 
 
 def notifications(user_id, role):
@@ -1237,37 +1263,22 @@ def notifications(user_id, role):
 
 
 def activity(user_id, role, limit=100):
-    q = sb().table("activity_logs").select("*")
-    if role != "admin":
-        q = q.eq("user_id", user_id)
-    rows = (q.order("created_at", desc=True).limit(limit).execute().data) or []
-    return rows
+    with db() as conn:
+        if role == "admin":
+            rows = conn.execute("select * from activity_logs order by created_at desc limit ?", (limit,)).fetchall()
+        else:
+            rows = conn.execute("select * from activity_logs where user_id = ? order by created_at desc limit ?", (user_id, limit)).fetchall()
+    return [dict(row) for row in rows]
 
 
 def save_lecture_version(user_id, lecture_id, title, content):
-    rows = (
-        sb()
-        .table("lecture_versions")
-        .select("version")
-        .eq("lecture_id", lecture_id)
-        .eq("owner_id", user_id)
-        .order("version", desc=True)
-        .limit(1)
-        .execute()
-        .data
-    ) or []
-    version = (rows[0]["version"] if rows else 0) + 1
-    sb().table("lecture_versions").insert(
-        {
-            "id": uuid.uuid4().hex,
-            "owner_id": user_id,
-            "lecture_id": lecture_id,
-            "title": title,
-            "content": content,
-            "version": version,
-            "created_at": utc_now(),
-        }
-    ).execute()
+    with db() as conn:
+        row = conn.execute("select max(version) as version from lecture_versions where lecture_id = ? and owner_id = ?", (lecture_id, user_id)).fetchone()
+        version = (row["version"] or 0) + 1
+        conn.execute(
+            "insert into lecture_versions values (?, ?, ?, ?, ?, ?, ?)",
+            (uuid.uuid4().hex, user_id, lecture_id, title, content, version, utc_now()),
+        )
     log_activity(user_id, "lecture.version", {"lecture_id": lecture_id, "version": version})
     return {"lecture_id": lecture_id, "version": version}
 
@@ -1276,22 +1287,41 @@ def backup_data(user_id, role):
     if role != "admin":
         raise PermissionError("Only admins can create backups.")
     backup_id = f"backup_{int(time.time())}.json"
+    target = BACKUP_DIR / backup_id
     payload = {}
-    for table in ("profiles", "documents", "document_chunks", "chats", "messages", "activity_logs", "lecture_versions"):
-        payload[table] = (sb().table(table).select("*").execute().data) or []
-    data = json.dumps(payload, indent=2).encode("utf-8")
-    storage_path = f"_backups/{backup_id}"
-    sb().storage.from_(SUPABASE_BUCKET).upload(storage_path, data, {"content-type": "application/json"})
+    with db() as conn:
+        for table in ("profiles", "documents", "document_chunks", "chats", "messages", "activity_logs", "lecture_versions"):
+            payload[table] = [dict(row) for row in conn.execute(f"select * from {table}").fetchall()]
+    target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     log_activity(user_id, "backup.create", {"backup": backup_id})
-    return {"backup_id": backup_id, "path": storage_path}
+    return {"backup_id": backup_id, "path": str(target)}
 
 
 def restore_data(user_id, role, payload):
     if role != "admin":
         raise PermissionError("Only admins can restore backups.")
-    allowed_tables = {"profiles", "documents", "document_chunks", "chats", "messages", "activity_logs", "lecture_versions"}
-    for table, rows in payload.items():
-        if table not in allowed_tables or not isinstance(rows, list) or not rows:
-            continue
-        sb().table(table).upsert(rows).execute()
+    allowed = {
+        "profiles": {"user_id", "email", "display_name", "role", "preferences", "updated_at"},
+        "documents": {"id", "owner_id", "chat_id", "filename", "content_type", "path", "text", "media_kind", "size_bytes", "summary", "created_at"},
+        "document_chunks": {"id", "document_id", "owner_id", "chat_id", "filename", "chunk_index", "locator_type", "locator_label", "page_number", "text", "embedding", "token_count", "created_at"},
+        "chats": {"id", "owner_id", "title", "role", "prompt_version", "system_prompt", "pinned", "bookmarked", "metadata", "created_at", "updated_at"},
+        "messages": {"id", "chat_id", "role", "content", "sources", "created_at"},
+        "activity_logs": {"id", "user_id", "action", "details", "created_at"},
+        "lecture_versions": {"id", "owner_id", "lecture_id", "title", "content", "version", "created_at"},
+    }
+    with db() as conn:
+        for table, rows in payload.items():
+            if table not in allowed or not isinstance(rows, list):
+                continue
+            if not rows:
+                continue
+            cols = [col for col in rows[0].keys() if col in allowed[table]]
+            if not cols:
+                continue
+            placeholders = ",".join("?" for _ in cols)
+            for row in rows:
+                conn.execute(
+                    f"insert or replace into {table} ({','.join(cols)}) values ({placeholders})",
+                    [row.get(col) for col in cols],
+                )
     log_activity(user_id, "backup.restore", {})
