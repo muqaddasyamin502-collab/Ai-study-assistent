@@ -96,7 +96,7 @@ CLAUDE_MODEL = clean_env_value(os.getenv("CLAUDE_MODEL")) or "claude-haiku-4-5"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 MAX_OUTPUT_TOKENS = int(clean_env_value(os.getenv("MAX_OUTPUT_TOKENS")) or "600")
-PDF_VISION_FALLBACK = clean_env_value(os.getenv("PDF_VISION_FALLBACK")).lower() == "true"
+PDF_VISION_FALLBACK = clean_env_value(os.getenv("PDF_VISION_FALLBACK") or "true").lower() == "true"
 
 FIREBASE_CONFIG = {
     "apiKey": clean_env_value(os.getenv("FIREBASE_API_KEY")),
@@ -290,6 +290,34 @@ def context_message(website_context):
         "Do not invent details that are not present here.\n\n"
         f"{website_context}"
     )
+
+
+def workspace_context(metadata):
+    context = metadata.get("context") if isinstance(metadata, dict) else {}
+    if not isinstance(context, dict):
+        return ""
+    context_type = clean_text(context.get("type", "")).lower()
+    if context_type not in {"project", "gem"}:
+        return ""
+
+    name = clean_text(context.get("name", ""))[:120]
+    desc = clean_text(context.get("desc", ""))[:600]
+    instructions = clean_text(context.get("prompt", "") or context.get("instructions", ""))[:2500]
+    if not any([name, desc, instructions]):
+        return ""
+
+    label = "Project" if context_type == "project" else "Gem"
+    lines = [f"This conversation is inside a saved {label} workspace."]
+    if name:
+        lines.append(f"{label} name: {name}")
+    if desc:
+        lines.append(f"{label} description: {desc}")
+    if instructions:
+        lines.append(f"{label} instructions: {instructions}")
+    lines.append(
+        "Use these workspace instructions for every answer in this chat, while still following the main system rules."
+    )
+    return "\n".join(lines)
 
 
 def asks_about_visual_file(query):
@@ -735,7 +763,8 @@ def chat():
                 "answer from the newly uploaded image.\n\n"
                 f"Image records found:\n{listed}"
             )
-    if PDF_VISION_FALLBACK and not vision_attachments and document_question and not direct_document_context:
+    has_text_source = any(source.get("chunk") for source in sources)
+    if PDF_VISION_FALLBACK and not vision_attachments and document_question and not has_text_source:
         pdf_pages = recent_pdf_page_attachments(user_id, chat_id)
         if pdf_pages:
             vision_attachments = pdf_pages
@@ -759,7 +788,10 @@ def chat():
                 }
                 for page in pdf_pages
             )
-    has_text_source = any(source.get("chunk") for source in sources)
+            if direct_document_context and "could not extract readable text" in direct_document_context.lower():
+                document_context = ""
+                direct_document_context = ""
+            has_text_source = any(source.get("chunk") for source in sources)
     upload_status_context = uploaded_document_status_context(
         user_id,
         latest_user_message,
@@ -775,7 +807,15 @@ def chat():
         )
     combined_context = "\n\n---\n\n".join(
         part
-        for part in [website_context, document_context, vision_context, attachment_instruction, upload_status_context, client_attachment_context]
+        for part in [
+            workspace_context(metadata),
+            website_context,
+            document_context,
+            vision_context,
+            attachment_instruction,
+            upload_status_context,
+            client_attachment_context,
+        ]
         if part
     )
     context_prompt = context_message(combined_context)
