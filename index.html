@@ -3141,11 +3141,13 @@ function itemForm(type) {
     const isGem = type === 'gem';
     return `
     <div class="gem" style="cursor:default">
-      <div class="g-nm">Create ${isGem ? 'Gem' : 'Project'}</div>
+      <div class="g-nm" id="${type}FormTitle">Create ${isGem ? 'Gem' : 'Project'}</div>
+      <input type="hidden" id="${type}EditId" />
       <input class="s-inp" id="${type}Name" placeholder="${isGem ? 'Gem name' : 'Project name'}" />
       <input class="s-inp" id="${type}Desc" placeholder="Short description" />
-      <textarea class="s-inp" id="${type}Prompt" rows="3" placeholder="Prompt or instruction to send to the bot"></textarea>
-      <button class="new-btn" style="margin:0;width:100%;justify-content:center" onclick="saveCustomItem('${type}')">+ Create</button>
+      <textarea class="s-inp" id="${type}Prompt" rows="3" placeholder="${isGem ? 'Prompt to send when this Gem runs' : 'Project instructions for every chat'}"></textarea>
+      <button class="new-btn" style="margin:0 0 8px;width:100%;justify-content:center" onclick="saveCustomItem('${type}')">Save</button>
+      <button class="new-btn" id="${type}CancelEdit" style="display:none;margin:0;width:100%;justify-content:center" onclick="resetCustomForm('${type}')">Cancel edit</button>
     </div>
     <div id="${type}List"></div>`;
 }
@@ -3164,21 +3166,54 @@ function openProj() {
 
 function saveCustomItem(type) {
     const key = type === 'gem' ? GK : PK;
+    const editId = document.getElementById(type + 'EditId').value.trim();
     const name = document.getElementById(type + 'Name').value.trim();
     const desc = document.getElementById(type + 'Desc').value.trim();
     const prompt = document.getElementById(type + 'Prompt').value.trim();
-    if (!name || !prompt) {
-        toast('Name and prompt required', true);
+    if (!name || (type === 'gem' && !prompt)) {
+        toast(type === 'gem' ? 'Name and prompt required' : 'Project name required', true);
         return;
     }
     const items = getSaved(key);
-    items.unshift({ id: type[0] + Date.now(), name, desc, prompt, ts: Date.now() });
+    const existingIndex = items.findIndex(item => item.id === editId);
+    const saved = {
+        id: editId || type[0] + Date.now(),
+        name,
+        desc,
+        prompt,
+        ts: Date.now()
+    };
+    if (existingIndex >= 0) items[existingIndex] = { ...items[existingIndex], ...saved };
+    else items.unshift(saved);
     putSaved(key, items);
+    updateContextForEditedItem(type, saved);
+    resetCustomForm(type);
+    renderCustomItems(type);
+    toast(type === 'gem' ? 'Gem saved' : 'Project saved');
+}
+
+function resetCustomForm(type) {
+    document.getElementById(type + 'EditId').value = '';
     document.getElementById(type + 'Name').value = '';
     document.getElementById(type + 'Desc').value = '';
     document.getElementById(type + 'Prompt').value = '';
-    renderCustomItems(type);
-    toast(type === 'gem' ? 'Gem created' : 'Project created');
+    const title = document.getElementById(type + 'FormTitle');
+    const cancel = document.getElementById(type + 'CancelEdit');
+    if (title) title.textContent = `Create ${type === 'gem' ? 'Gem' : 'Project'}`;
+    if (cancel) cancel.style.display = 'none';
+}
+
+function editCustomItem(type, encodedId) {
+    const item = findSavedItem(type, encodedId);
+    if (!item) return;
+    document.getElementById(type + 'EditId').value = item.id;
+    document.getElementById(type + 'Name').value = item.name || '';
+    document.getElementById(type + 'Desc').value = item.desc || '';
+    document.getElementById(type + 'Prompt').value = item.prompt || '';
+    const title = document.getElementById(type + 'FormTitle');
+    const cancel = document.getElementById(type + 'CancelEdit');
+    if (title) title.textContent = `Edit ${type === 'gem' ? 'Gem' : 'Project'}`;
+    if (cancel) cancel.style.display = 'flex';
 }
 
 function renderCustomItems(type) {
@@ -3199,15 +3234,17 @@ function renderCustomItems(type) {
       <div class="g-ds">${esc(item.desc || item.prompt.slice(0, 90))}</div>
       <span class="g-tg" onclick="openItemChats('gem','${id}')">${countItemChats('gem', item.id)} chats</span>
       <div class="prj-ask" onclick="startItemChat('gem','${id}')">Start new chat</div>
+      <div class="prj-ask" onclick="editCustomItem('gem','${id}')">Edit Gem</div>
       <button class="hdel" style="opacity:.8;float:right" onclick="deleteCustomItem('gem','${id}')">Delete</button>
     </div>`;
         }
         return `
     <div class="prj">
       <div class="prj-h">${esc(item.name)} <span class="pbadge active">Saved</span></div>
-      <div class="prj-d">${esc(item.desc || item.prompt.slice(0, 100))}</div>
-      <div class="prj-ask" onclick="openItemChats('project','${id}')">Open ${countItemChats('project', item.id)} chats</div>
-      <div class="prj-ask" onclick="startItemChat('project','${id}')">Start new chat</div>
+      <div class="prj-d">${esc(item.desc || item.prompt || 'Project workspace')}</div>
+      <div class="prj-ask" onclick="openItemChats('project','${id}')">Open project (${countItemChats('project', item.id)} chats)</div>
+      <div class="prj-ask" onclick="startItemChat('project','${id}')">New chat in project</div>
+      <div class="prj-ask" onclick="editCustomItem('project','${id}')">Edit instructions</div>
       <button class="hdel" style="opacity:.8" onclick="deleteCustomItem('project','${id}')">Delete</button>
     </div>`;
     }).join('');
@@ -3218,6 +3255,7 @@ function deleteCustomItem(type, encodedId) {
     const id = decodeURIComponent(encodedId);
     putSaved(key, getSaved(key).filter(item => item.id !== id));
     deleteCloudItem(type === 'gem' ? 'gems' : 'projects', id);
+    clearDeletedItemContext(type, id);
     renderCustomItems(type);
     toast('Deleted');
 }
@@ -3232,36 +3270,108 @@ function countItemChats(type, id) {
     return getSess().filter(s => s.context && s.context.type === type && s.context.id === id).length;
 }
 
+function makeWorkspaceContext(type, item) {
+    return {
+        type,
+        id: item.id,
+        name: item.name || '',
+        desc: item.desc || '',
+        prompt: item.prompt || ''
+    };
+}
+
+function chatsForItem(type, id) {
+    return getSess().filter(s => s.context && s.context.type === type && s.context.id === id);
+}
+
+function updateContextForEditedItem(type, item) {
+    const all = getSess();
+    let changed = false;
+    all.forEach(chat => {
+        if (chat.context && chat.context.type === type && chat.context.id === item.id) {
+            chat.context = makeWorkspaceContext(type, item);
+            changed = true;
+        }
+    });
+    if (currentContext && currentContext.type === type && currentContext.id === item.id) {
+        currentContext = makeWorkspaceContext(type, item);
+        changed = true;
+    }
+    if (changed) putSess(all);
+}
+
+function clearDeletedItemContext(type, id) {
+    const all = getSess();
+    let changed = false;
+    all.forEach(chat => {
+        if (chat.context && chat.context.type === type && chat.context.id === id) {
+            chat.context = null;
+            changed = true;
+        }
+    });
+    if (currentContext && currentContext.type === type && currentContext.id === id) currentContext = null;
+    if (changed) putSess(all);
+}
+
 function openItemChats(type, encodedId) {
     const item = findSavedItem(type, encodedId);
     if (!item) return;
-    const chats = getSess().filter(s => s.context && s.context.type === type && s.context.id === item.id);
+    const chats = chatsForItem(type, item.id);
     openP(`${esc(item.name)} <span>${type === 'gem' ? 'Gem' : 'Project'}</span>`);
     document.getElementById('pBody').innerHTML = `
       <div class="prj">
         <div class="prj-h">${esc(item.name)} <span class="pbadge active">${chats.length} chats</span></div>
         <div class="prj-d">${esc(item.desc || item.prompt)}</div>
-        <div class="prj-ask" onclick="startItemChat('${type}','${encodeURIComponent(item.id)}')">Start new chat</div>
+        <div class="prj-ask" onclick="startItemChat('${type}','${encodeURIComponent(item.id)}')">${type === 'project' ? 'New chat in project' : 'Start new chat'}</div>
+        <div class="prj-ask" onclick="${type === 'project' ? 'openProj()' : 'openGems()'};editCustomItem('${type}','${encodeURIComponent(item.id)}')">Edit ${type === 'project' ? 'instructions' : 'Gem'}</div>
       </div>
+      <input class="s-inp" placeholder="Search this ${type === 'project' ? 'project' : 'Gem'}..." oninput="filterItemChats('${type}','${encodeURIComponent(item.id)}',this.value)" />
       <div id="itemChats">
-        ${chats.length ? chats.map(s => `
+        ${renderItemChatRows(chats)}
+      </div>`;
+}
+
+function renderItemChatRows(chats) {
+    if (!chats.length) return '<div class="no-res">No chats here yet. Start the first one above.</div>';
+    return chats.map(s => `
           <div class="hi" onclick="closePanel();loadSess('${s.id}')">
             <div class="hdot"></div>
             <div class="hlbl">${esc(s.title || 'Untitled')}</div>
-          </div>`).join('') : '<div class="no-res">No chats here yet. Start the first one above.</div>'}
-      </div>`;
+          </div>`).join('');
+}
+
+function filterItemChats(type, encodedId, query) {
+    const item = findSavedItem(type, encodedId);
+    const el = document.getElementById('itemChats');
+    if (!item || !el) return;
+    const q = query.trim().toLowerCase();
+    const chats = chatsForItem(type, item.id).filter(s => {
+        if (!q) return true;
+        return (s.title || '').toLowerCase().includes(q) ||
+            (s.msgs || []).some(msg => (msg.content || '').toLowerCase().includes(q));
+    });
+    el.innerHTML = renderItemChatRows(chats);
 }
 
 function startItemChat(type, encodedId) {
     const item = findSavedItem(type, encodedId);
     if (!item) return;
-    currentContext = { type, id: item.id, name: item.name };
+    currentContext = makeWorkspaceContext(type, item);
     sessId = 's' + Date.now();
     msgs = [];
     closePanel();
     closeSB();
-    document.getElementById('ta').value = item.prompt;
-    send();
+    wipeUI();
+    document.getElementById('welcome').style.display = 'flex';
+    if (type === 'gem') {
+        document.getElementById('ta').value = item.prompt;
+        send();
+        return;
+    }
+    document.getElementById('ta').value = '';
+    document.getElementById('ta').focus();
+    saveSess(`${item.name} project chat`);
+    toast('Project chat ready');
 }
 
 function hideW(){const w=document.getElementById('welcome');if(w)w.style.display='none';}
