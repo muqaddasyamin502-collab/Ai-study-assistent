@@ -53,6 +53,10 @@ def handle_unexpected_error(exc):
         if isinstance(exc, HTTPException):
             return jsonify({"error": exc.name, "details": exc.description}), exc.code or 500
         return jsonify({"error": "Backend error", "details": str(exc)}), 500
+    # Keep normal browser 404/403 responses intact. Re-raising an HTTPException
+    # from this catch-all handler turns a missing static file into a 500 error.
+    if isinstance(exc, HTTPException):
+        return exc
     raise exc
 
 
@@ -83,8 +87,21 @@ GROQ_API_KEY = clean_env_value(os.getenv("GROQ_API_KEY") or os.getenv("GROK_API_
 GROQ_MODEL = clean_env_value(os.getenv("GROQ_MODEL"))
 if not GROQ_MODEL:
     old_model = clean_env_value(os.getenv("GROK_MODEL"))
-    GROQ_MODEL = old_model if old_model and not old_model.lower().startswith("grok-") else "llama-3.3-70b-versatile"
-GROQ_VISION_MODEL = clean_env_value(os.getenv("GROQ_VISION_MODEL")) or "meta-llama/llama-4-scout-17b-16e-instruct"
+    GROQ_MODEL = old_model if old_model and not old_model.lower().startswith("grok-") else "openai/gpt-oss-120b"
+
+# Groq retired Llama 3.3 70B on 16 August 2026.  Map the old IDs so an
+# existing Render environment does not make the chatbot unavailable after a
+# redeploy.  GROQ_MODEL remains configurable for future model changes.
+DEPRECATED_GROQ_MODELS = {
+    "llama-3.1-8b-instant": "openai/gpt-oss-20b",
+    "llama-3.3-70b-versatile": "openai/gpt-oss-120b",
+    "meta-llama/llama-4-scout-17b-16e-instruct": "qwen/qwen3.6-27b",
+}
+GROQ_MODEL = DEPRECATED_GROQ_MODELS.get(GROQ_MODEL.lower(), GROQ_MODEL)
+GROQ_VISION_MODEL = clean_env_value(os.getenv("GROQ_VISION_MODEL")) or "qwen/qwen3.6-27b"
+GROQ_VISION_MODEL = DEPRECATED_GROQ_MODELS.get(
+    GROQ_VISION_MODEL.lower(), GROQ_VISION_MODEL
+)
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 GEMINI_API_KEY = clean_env_value(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
