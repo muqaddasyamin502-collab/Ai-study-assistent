@@ -1,5 +1,6 @@
 import os
 import re
+import secrets
 from urllib.parse import quote_plus, urljoin, urlparse
 
 import requests
@@ -14,18 +15,26 @@ from services import (
     activity,
     analytics,
     backup_data,
+    bzu_import_status,
+    bzu_rag_context,
     create_or_update_chat,
+    create_course,
     dashboard,
     db,
     dependency_status,
     document_context_for_ids,
     export_chat,
     get_profile,
+    get_course,
     get_user_id,
     get_user_role,
     init_db,
+    import_bzu_website,
     list_documents,
+    list_courses,
     log_activity,
+    join_course,
+    may_access_course,
     rag_context,
     recent_image_attachments,
     recent_pdf_page_attachments,
@@ -33,6 +42,7 @@ from services import (
     save_document,
     save_lecture_version,
     set_chat_flag,
+    submit_feedback,
     suggested_questions,
     upsert_profile,
 )
@@ -41,7 +51,9 @@ load_dotenv()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-app = Flask(__name__, static_folder=BASE_DIR, static_url_path="")
+# Do not expose the project directory as Flask's static folder: it contains .env
+# and the local SQLite database. The UI is served by the explicit routes below.
+app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 CORS(app)
 init_db()
@@ -52,7 +64,7 @@ def handle_unexpected_error(exc):
     if request.path.startswith("/api/"):
         if isinstance(exc, HTTPException):
             return jsonify({"error": exc.name, "details": exc.description}), exc.code or 500
-        return jsonify({"error": "Backend error", "details": str(exc)}), 500
+        return jsonify({"error": "Backend error. Please try again."}), 500
     # Keep normal browser 404/403 responses intact. Re-raising an HTTPException
     # from this catch-all handler turns a missing static file into a 500 error.
     if isinstance(exc, HTTPException):
@@ -111,6 +123,8 @@ GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model
 CLAUDE_API_KEY = clean_env_value(os.getenv("CLAUDE_API_KEY") or os.getenv("ANTHROPIC_API_KEY"))
 CLAUDE_MODEL = clean_env_value(os.getenv("CLAUDE_MODEL")) or "claude-haiku-4-5"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
+BZU_IMPORT_TOKEN = clean_env_value(os.getenv("BZU_IMPORT_TOKEN"))
+FIREBASE_AUTH_REQUIRED = clean_env_value(os.getenv("FIREBASE_AUTH_REQUIRED") or "false").lower() == "true"
 
 MAX_OUTPUT_TOKENS = int(clean_env_value(os.getenv("MAX_OUTPUT_TOKENS")) or "600")
 PDF_VISION_FALLBACK = clean_env_value(os.getenv("PDF_VISION_FALLBACK") or "true").lower() == "true"
@@ -159,6 +173,30 @@ Rules:
 7. Be helpful, friendly, and encouraging for BZU students.
 8. If asked who created you, who made you, who built you, your owner, your developer, or your author, answer only with this identity: "Muqaddas Yamin is my author. She made me to help CASPAM and BZU students." Do not mention Meta, OpenAI, Groq, Anthropic, or the base model in that answer.
 """.strip()
+
+
+@app.before_request
+def verify_firebase_identity():
+    """In production, accept identity and roles only from verified Firebase tokens."""
+    if not FIREBASE_AUTH_REQUIRED or not request.path.startswith("/api/"):
+        return None
+    if request.path in {"/api/health", "/api/firebase-config"}:
+        return None
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if not token:
+        return jsonify({"error": "Sign in is required."}), 401
+    try:
+        import firebase_admin
+        from firebase_admin import auth
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app()
+        decoded = auth.verify_id_token(token)
+    except Exception:
+        return jsonify({"error": "Your sign-in token could not be verified."}), 401
+    request.environ["HTTP_X_USER_ID"] = decoded["uid"]
+    request.environ["HTTP_X_FIREBASE_UID"] = decoded["uid"]
+    request.environ["HTTP_X_USER_EMAIL"] = decoded.get("email", "")
+    request.environ["HTTP_X_USER_ROLE"] = decoded.get("role", "student") if decoded.get("role") in {"student", "teacher", "admin"} else "student"
 
 
 def clean_text(text):
@@ -245,6 +283,17 @@ def build_website_context(query):
         except Exception as exc:
             chunks.append(f"Source: {source}\nStatus: Could not fetch live content ({exc}).")
     return "\n\n---\n\n".join(chunks)
+
+
+def is_bzu_question(query):
+    query = (query or "").lower()
+    return any(
+        word in query
+        for word in (
+            "bzu", "bahau", "multan university", "caspam", "admission", "merit",
+            "prospectus", "scholarship", "hostel", "transport", "academic calendar",
+        )
+    )
 
 
 def normalize_messages(messages):
@@ -666,6 +715,7 @@ def health():
                 "render_free_storage": "Uploads on Render free tier are temporary; re-upload files after redeploy/restart.",
             },
             "sources": KNOWLEDGE_SOURCES,
+            "bzu_knowledge_base": bzu_import_status(),
             "prompt_version": LATEST_PROMPT_VERSION,
         }
     )
@@ -678,6 +728,30 @@ def firebase_config():
         for key in ["apiKey", "authDomain", "projectId", "appId"]
     )
     return jsonify({"enabled": enabled, "config": FIREBASE_CONFIG if enabled else {}})
+
+
+@app.get("/api/bzu/import-status")
+def bzu_import_status_route():
+    return jsonify({"official_source": "https://bzu.edu.pk/", **bzu_import_status()})
+
+
+@app.post("/api/bzu/import")
+def bzu_import_route():
+    """Refresh the local cache from the public official BZU sitemap.
+
+    A server-only token prevents a student browser from launching a large crawl.
+    """
+    if not BZU_IMPORT_TOKEN:
+        return jsonify({"error": "Set BZU_IMPORT_TOKEN in server environment variables before importing."}), 503
+    supplied = request.headers.get("X-BZU-Import-Token", "")
+    if not secrets.compare_digest(supplied, BZU_IMPORT_TOKEN):
+        return jsonify({"error": "Unauthorized."}), 401
+    data = request.get_json(silent=True) or {}
+    try:
+        result = import_bzu_website(data.get("max_pages"))
+        return jsonify({"ok": True, "result": result})
+    except requests.RequestException:
+        return jsonify({"error": "Could not reach the official BZU sitemap right now."}), 502
 
 
 @app.post("/api/chat")
@@ -735,7 +809,11 @@ def chat():
         rag_query = f"{latest_user_message} summarize explain the attached document"
 
     website_context = build_website_context(latest_user_message)
+    official_bzu_context, official_bzu_sources = ("", [])
+    if is_bzu_question(latest_user_message):
+        official_bzu_context, official_bzu_sources = bzu_rag_context(latest_user_message)
     document_context, sources = rag_context(user_id, rag_query, chat_id)
+    sources.extend(official_bzu_sources)
     direct_document_context, direct_sources = document_context_for_ids(user_id, chat_id, latest_document_ids)
     if direct_document_context:
         document_context = "\n\n---\n\n".join(part for part in [direct_document_context, document_context] if part)
@@ -826,6 +904,7 @@ def chat():
         part
         for part in [
             workspace_context(metadata),
+            official_bzu_context,
             website_context,
             document_context,
             vision_context,
@@ -897,7 +976,7 @@ def profile_save():
         user_id,
         clean_text(data.get("email", "")),
         clean_text(data.get("display_name", "")),
-        clean_text(data.get("role", "student")),
+        get_user_role(request),
         data.get("preferences") if isinstance(data.get("preferences"), dict) else {},
     )
     return jsonify({"profile": get_profile(user_id)})
@@ -916,7 +995,10 @@ def upload():
         return jsonify({"error": "No file uploaded."}), 400
     try:
         chat_id = clean_text(request.form.get("chat_id", ""))[:128]
-        docs = [save_document(user_id, file, chat_id) for file in files if file and file.filename]
+        course_id = clean_text(request.form.get("course_id", ""))[:128]
+        if course_id and not may_access_course(user_id, course_id, teacher_only=True):
+            return jsonify({"error": "Only the course teacher can upload shared lectures."}), 403
+        docs = [save_document(user_id, file, chat_id, course_id) for file in files if file and file.filename]
         return jsonify({"document": docs[0] if docs else None, "documents": list_documents(user_id, chat_id), "uploaded": docs})
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
@@ -926,6 +1008,39 @@ def upload():
 def documents():
     chat_id = clean_text(request.args.get("chat_id", ""))[:128]
     return jsonify({"documents": list_documents(get_user_id(request), chat_id or None)})
+
+
+@app.get("/api/courses")
+def courses():
+    return jsonify({"courses": list_courses(get_user_id(request))})
+
+
+@app.post("/api/courses")
+def course_create():
+    user_id = get_user_id(request)
+    data = request.get_json(silent=True) or {}
+    if get_user_role(request) not in {"teacher", "admin"}:
+        return jsonify({"error": "Only teachers can create courses."}), 403
+    if not clean_text(data.get("code", "")) or not clean_text(data.get("title", "")):
+        return jsonify({"error": "Course code and title are required."}), 400
+    return jsonify({"course": create_course(user_id, data["code"], data["title"], data.get("department", ""), data.get("semester", ""))}), 201
+
+
+@app.post("/api/courses/<course_id>/join")
+def course_join(course_id):
+    try:
+        return jsonify({"course": join_course(get_user_id(request), course_id)})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 404
+
+
+@app.post("/api/feedback")
+def feedback():
+    data = request.get_json(silent=True) or {}
+    try:
+        return jsonify(submit_feedback(get_user_id(request), data.get("rating"), data.get("message", ""), data.get("chat_id", ""), data.get("course_id", ""), data.get("details", "")))
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
 
 
 @app.get("/api/dashboard")
@@ -1018,6 +1133,9 @@ def bzu_info(subpath=""):
 
 @app.get("/<path:path>")
 def static_files(path):
+    # Keep environment variables, the database and source code unreachable from browsers.
+    if path not in {"style.css"}:
+        return jsonify({"error": "Not found."}), 404
     return send_from_directory(BASE_DIR, path)
 
 
