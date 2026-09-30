@@ -1,5 +1,6 @@
 import base64
 import csv
+import hashlib
 import importlib.util
 import io
 import json
@@ -14,6 +15,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urljoin, urlparse, urldefrag
 from xml.etree import ElementTree
 import requests
 
@@ -43,6 +45,12 @@ PDF_OCR_MAX_PAGES = int(os.getenv("PDF_OCR_MAX_PAGES", "25"))
 VISION_IMAGE_MAX_BYTES = int(os.getenv("VISION_IMAGE_MAX_BYTES", str(900_000)))
 VISION_IMAGE_MAX_DIMENSION = int(os.getenv("VISION_IMAGE_MAX_DIMENSION", "1000"))
 PDF_VISION_MAX_PAGES = int(os.getenv("PDF_VISION_MAX_PAGES", "2"))
+BZU_BASE_URL = "https://bzu.edu.pk/"
+BZU_SITEMAP_URL = urljoin(BZU_BASE_URL, "sitemap.xml")
+BZU_IMPORT_MAX_PAGES = int(os.getenv("BZU_IMPORT_MAX_PAGES", "500"))
+BZU_IMPORT_DELAY_SECONDS = float(os.getenv("BZU_IMPORT_DELAY_SECONDS", "0.15"))
+BZU_PAGE_MAX_CHARS = int(os.getenv("BZU_PAGE_MAX_CHARS", "18000"))
+MAX_BZU_RAG_CHUNKS = int(os.getenv("MAX_BZU_RAG_CHUNKS", "7"))
 
 
 class TextOnlyHTMLParser(HTMLParser):
@@ -56,6 +64,43 @@ class TextOnlyHTMLParser(HTMLParser):
 
     def text(self):
         return " ".join(self.parts)
+
+
+class BZUPageParser(HTMLParser):
+    """Extract visible text from public BZU pages without adding a paid service."""
+    ignored_tags = {"script", "style", "noscript", "svg", "nav", "footer", "form"}
+
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self.title_parts = []
+        self._ignored_depth = 0
+        self._in_title = False
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag in self.ignored_tags:
+            self._ignored_depth += 1
+        if tag == "title" and not self._ignored_depth:
+            self._in_title = True
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag == "title":
+            self._in_title = False
+        if tag in self.ignored_tags and self._ignored_depth:
+            self._ignored_depth -= 1
+
+    def handle_data(self, data):
+        value = clean_text(data)
+        if not value or self._ignored_depth:
+            return
+        self.parts.append(value)
+        if self._in_title:
+            self.title_parts.append(value)
+
+    def result(self):
+        return clean_text(" ".join(self.title_parts)), clean_text(" ".join(self.parts))
 
 
 def utc_now():
@@ -92,6 +137,7 @@ def init_db():
                 id text primary key,
                 owner_id text,
                 chat_id text,
+                course_id text,
                 filename text not null,
                 content_type text,
                 path text not null,
@@ -165,6 +211,36 @@ def init_db():
                 version integer not null,
                 created_at text not null
             );
+            create table if not exists bzu_pages (
+                url text primary key,
+                title text,
+                content text not null,
+                content_hash text,
+                imported_at text not null,
+                source_lastmod text
+            );
+            create table if not exists bzu_chunks (
+                id text primary key,
+                page_url text not null,
+                title text,
+                chunk_index integer not null,
+                content text not null,
+                embedding text,
+                created_at text not null
+            );
+            create index if not exists idx_bzu_chunks_page on bzu_chunks(page_url, chunk_index);
+            create table if not exists courses (
+                id text primary key, code text not null, title text not null, department text,
+                semester text, owner_id text not null, created_at text not null
+            );
+            create table if not exists course_members (
+                course_id text not null, user_id text not null, role text not null,
+                created_at text not null, primary key (course_id, user_id)
+            );
+            create table if not exists answer_feedback (
+                id text primary key, user_id text not null, chat_id text, course_id text,
+                message text, rating integer not null, details text, created_at text not null
+            );
             """
         )
         cols = {row["name"] for row in conn.execute("pragma table_info(documents)").fetchall()}
@@ -173,6 +249,7 @@ def init_db():
             "media_kind": "alter table documents add column media_kind text",
             "size_bytes": "alter table documents add column size_bytes integer default 0",
             "summary": "alter table documents add column summary text",
+            "course_id": "alter table documents add column course_id text",
         }
         for col, sql in migrations.items():
             if col not in cols:
@@ -268,6 +345,53 @@ def make_segment(text, locator_type="document", locator_label="Document", page_n
         "locator_label": locator_label,
         "page_number": page_number,
     }
+
+
+def create_course(owner_id, code, title, department="", semester=""):
+    course_id = uuid.uuid4().hex
+    now = utc_now()
+    with db() as conn:
+        conn.execute("insert into courses values (?, ?, ?, ?, ?, ?, ?)", (course_id, clean_text(code)[:40], clean_text(title)[:160], clean_text(department)[:100], clean_text(semester)[:40], owner_id, now))
+        conn.execute("insert into course_members values (?, ?, ?, ?)", (course_id, owner_id, "teacher", now))
+    return get_course(owner_id, course_id)
+
+
+def get_course(user_id, course_id):
+    with db() as conn:
+        row = conn.execute("""select c.*, m.role as member_role from courses c join course_members m on m.course_id=c.id
+                              where c.id=? and m.user_id=?""", (course_id, user_id)).fetchone()
+    return dict(row) if row else None
+
+
+def list_courses(user_id):
+    with db() as conn:
+        rows = conn.execute("""select c.*, m.role as member_role, count(distinct cm.user_id) as members
+                               from courses c join course_members m on m.course_id=c.id and m.user_id=?
+                               left join course_members cm on cm.course_id=c.id group by c.id order by c.created_at desc""", (user_id,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def join_course(user_id, course_id):
+    with db() as conn:
+        if not conn.execute("select 1 from courses where id=?", (course_id,)).fetchone():
+            raise ValueError("Course not found.")
+        conn.execute("insert or ignore into course_members values (?, ?, ?, ?)", (course_id, user_id, "student", utc_now()))
+    return get_course(user_id, course_id)
+
+
+def may_access_course(user_id, course_id, teacher_only=False):
+    if not course_id:
+        return True
+    course = get_course(user_id, course_id)
+    return bool(course and (not teacher_only or course["member_role"] in {"teacher", "admin"}))
+
+
+def submit_feedback(user_id, rating, message="", chat_id="", course_id="", details=""):
+    if int(rating) not in {-1, 1}:
+        raise ValueError("Rating must be 1 or -1.")
+    with db() as conn:
+        conn.execute("insert into answer_feedback values (?, ?, ?, ?, ?, ?, ?, ?)", (uuid.uuid4().hex, user_id, chat_id, course_id, clean_text(message)[:4000], int(rating), clean_text(details)[:1000], utc_now()))
+    return {"ok": True}
 
 
 def extract_docx(raw):
@@ -523,6 +647,143 @@ def sparse_similarity(query_embedding, chunk_embedding):
     return dot / (q_norm * c_norm)
 
 
+def normalize_bzu_url(url):
+    """Keep the importer limited to the official public BZU site."""
+    try:
+        clean_url, _ = urldefrag((url or "").strip())
+        parsed = urlparse(clean_url)
+        if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() not in {"bzu.edu.pk", "www.bzu.edu.pk"}:
+            return ""
+        path = parsed.path or "/"
+        if Path(path).suffix.lower() in {".pdf", ".jpg", ".jpeg", ".png", ".gif", ".zip", ".doc", ".docx", ".xls", ".xlsx"}:
+            return ""
+        return f"https://bzu.edu.pk{path}" + (f"?{parsed.query}" if parsed.query else "")
+    except Exception:
+        return ""
+
+
+def bzu_sitemap_urls():
+    response = requests.get(
+        BZU_SITEMAP_URL,
+        timeout=30,
+        headers={"User-Agent": "UniLearn-AI-BZU-Indexer/1.0 (educational research)"},
+    )
+    response.raise_for_status()
+    root = ElementTree.fromstring(response.content)
+    urls = []
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] != "loc" or not element.text:
+            continue
+        url = normalize_bzu_url(element.text)
+        if url and url not in urls:
+            urls.append(url)
+    if BZU_BASE_URL not in urls:
+        urls.insert(0, BZU_BASE_URL)
+    return urls
+
+
+def fetch_bzu_page(url):
+    response = requests.get(
+        url,
+        timeout=30,
+        headers={"User-Agent": "UniLearn-AI-BZU-Indexer/1.0 (educational research)"},
+    )
+    response.raise_for_status()
+    if "html" not in response.headers.get("content-type", "").lower():
+        return "", ""
+    parser = BZUPageParser()
+    parser.feed(response.text)
+    title, content = parser.result()
+    return title[:300], content[:BZU_PAGE_MAX_CHARS]
+
+
+def import_bzu_website(max_pages=None):
+    """Cache public BZU sitemap pages locally for fast, source-cited RAG answers.
+
+    The import is deliberately bounded and only uses bzu.edu.pk HTML pages. It is
+    safe to run again: unchanged pages keep their existing chunks.
+    """
+    init_db()
+    max_pages = min(max(1, int(max_pages or BZU_IMPORT_MAX_PAGES)), BZU_IMPORT_MAX_PAGES)
+    urls = bzu_sitemap_urls()[:max_pages]
+    result = {"discovered": len(urls), "imported": 0, "unchanged": 0, "skipped": 0, "failed": 0}
+    for position, url in enumerate(urls):
+        try:
+            title, content = fetch_bzu_page(url)
+            if len(content) < 120:
+                result["skipped"] += 1
+                continue
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            with db() as conn:
+                existing = conn.execute("select content_hash from bzu_pages where url = ?", (url,)).fetchone()
+                if existing and existing["content_hash"] == digest:
+                    result["unchanged"] += 1
+                    continue
+                now = utc_now()
+                conn.execute(
+                    """
+                    insert into bzu_pages (url, title, content, content_hash, imported_at, source_lastmod)
+                    values (?, ?, ?, ?, ?, '')
+                    on conflict(url) do update set title=excluded.title, content=excluded.content,
+                        content_hash=excluded.content_hash, imported_at=excluded.imported_at
+                    """,
+                    (url, title or url, content, digest, now),
+                )
+                conn.execute("delete from bzu_chunks where page_url = ?", (url,))
+                segments = [make_segment(content, "page", "BZU official website page")]
+                for index, chunk in enumerate(chunk_segments(segments), start=1):
+                    conn.execute(
+                        """insert into bzu_chunks (id, page_url, title, chunk_index, content, embedding, created_at)
+                           values (?, ?, ?, ?, ?, ?, ?)""",
+                        (uuid.uuid4().hex, url, title or url, index, chunk["text"], json.dumps(chunk["embedding"], separators=(",", ":")), now),
+                    )
+            result["imported"] += 1
+        except Exception:
+            result["failed"] += 1
+        if position < len(urls) - 1 and BZU_IMPORT_DELAY_SECONDS:
+            time.sleep(BZU_IMPORT_DELAY_SECONDS)
+    result["total_cached"] = bzu_import_status()["pages"]
+    return result
+
+
+def bzu_import_status():
+    init_db()
+    with db() as conn:
+        page = conn.execute("select count(*) as count, max(imported_at) as last_imported_at from bzu_pages").fetchone()
+        chunks = conn.execute("select count(*) as count from bzu_chunks").fetchone()
+    return {"pages": page["count"], "chunks": chunks["count"], "last_imported_at": page["last_imported_at"]}
+
+
+def bzu_rag_context(query, limit=MAX_BZU_RAG_CHUNKS):
+    query_embedding = sparse_embedding(query)
+    with db() as conn:
+        rows = conn.execute("select * from bzu_chunks").fetchall()
+    scored = []
+    for row in rows:
+        score = sparse_similarity(query_embedding, load_chunk_embedding(row["embedding"]))
+        score += score_text(query, row["title"]) * 0.04
+        if score > 0:
+            scored.append((score, dict(row)))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    selected = [row for _, row in scored[:limit]]
+    if not selected:
+        return "", []
+    context = "\n\n".join(
+        f"Official BZU source: {row['title']}\\nURL: {row['page_url']}\\nExcerpt: {row['content']}"
+        for row in selected
+    )
+    sources = [
+        {"title": row["title"], "url": row["page_url"], "chunk": row["chunk_index"], "citation": "Official BZU website"}
+        for row in selected
+    ]
+    instruction = (
+        "Use these cached official BZU website excerpts only for BZU information. "
+        "If the answer is absent or may have changed, say so and give the official URL. "
+        "Cite the official BZU page title in the answer.\n\n"
+    )
+    return instruction + context, sources
+
+
 def chunk_segments(segments, max_chars=CHUNK_CHARS, overlap=CHUNK_OVERLAP):
     chunks = []
     for segment in segments:
@@ -590,7 +851,7 @@ def describe_upload(filename, content_type, size_bytes, text):
     return "Document uploaded, but no readable text was extracted."
 
 
-def save_document(user_id, file_storage, chat_id=""):
+def save_document(user_id, file_storage, chat_id="", course_id=""):
     filename = safe_filename(file_storage.filename or "upload")
     if not allowed_file(filename):
         raise ValueError("Unsupported file type.")
@@ -612,10 +873,10 @@ def save_document(user_id, file_storage, chat_id=""):
     with db() as conn:
         conn.execute(
             """
-            insert into documents (id, owner_id, chat_id, filename, content_type, path, text, media_kind, size_bytes, summary, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            insert into documents (id, owner_id, chat_id, course_id, filename, content_type, path, text, media_kind, size_bytes, summary, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (doc_id, user_id, clean_text(chat_id)[:128], filename, file_storage.mimetype, str(target), text, kind, len(raw), summary, now),
+            (doc_id, user_id, clean_text(chat_id)[:128], clean_text(course_id)[:128], filename, file_storage.mimetype, str(target), text, kind, len(raw), summary, now),
         )
         for index, chunk in enumerate(chunks, start=1):
             conn.execute(
@@ -642,7 +903,7 @@ def save_document(user_id, file_storage, chat_id=""):
                     now,
                 ),
             )
-    log_activity(user_id, "document.upload", {"document_id": doc_id, "filename": filename, "chat_id": chat_id})
+    log_activity(user_id, "document.upload", {"document_id": doc_id, "filename": filename, "chat_id": chat_id, "course_id": course_id})
     return {
         "id": doc_id,
         "filename": filename,
@@ -651,6 +912,7 @@ def save_document(user_id, file_storage, chat_id=""):
         "size_bytes": len(raw),
         "summary": summary,
         "chat_id": clean_text(chat_id)[:128],
+        "course_id": clean_text(course_id)[:128],
         "text_chars": len(text),
         "chunks": len(chunks),
         "ocr_used": Path(filename).suffix.lower() in IMAGE_EXTENSIONS,
